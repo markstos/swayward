@@ -22,6 +22,10 @@ On the operator's machine the three `swayward-wm` repos live side by side:
 | `~/hacking/swayward-wm/oracle` | `swayward-wm/sway-ipc-oracle` |
 | `~/hacking/swayward-wm/org` | `swayward-wm/.github`, the org profile and logo |
 
+Unfinished maintainer work lives in
+[`docs/internal/BACKLOG.md`](docs/internal/BACKLOG.md) (migrated from
+`mu -w swayward`). Do not treat that workstream as the live backlog.
+
 Worktrees, scratch output and extra target directories go beside them under
 `~/hacking/swayward-wm/`, never inside a repo. See "Scratch space lives on
 disk" for where.
