@@ -1138,7 +1138,22 @@ class Translator:
         if match is None:
             return
         effects: list[str] = []
-        for directive in re.split(r"\s*,\s*|\s*;\s*", command):
+        directives = [
+            directive
+            for directive in re.split(r"\s*,\s*|\s*;\s*", command)
+            # sway ignores an empty segment of a command list, so a trailing
+            # separator is not a command (sway/sway/commands.c:257-260).
+            if directive.strip()
+        ]
+        if not directives:
+            self.warn(
+                source,
+                line,
+                f"for_window {criteria} {command}",
+                "for_window needs a command",
+            )
+            return
+        for directive in directives:
             words = directive.split()
             if words[:1] == ["border"]:
                 if words == ["border", "none"]:
