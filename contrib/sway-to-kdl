@@ -1297,6 +1297,17 @@ class Translator:
                 "toggle",
             }:
                 effects.append(f"    sway-for-window-command {self.quote(directive)}")
+            elif len(words) == 2 and words[0] == "inhibit_idle" and words[1] in {
+                "focus",
+                "fullscreen",
+                "open",
+                "none",
+                "visible",
+            }:
+                # swayward implements sway's five user idle-inhibit policies
+                # (sway/sway/commands/inhibit_idle.c:22-35) and runs the
+                # command against the window after it maps.
+                effects.append(f"    sway-for-window-command {self.quote(directive)}")
             elif words[:1] == ["dim_inactive"] and len(words) == 2:
                 effects = [
                     effect

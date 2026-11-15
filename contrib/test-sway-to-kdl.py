@@ -1208,6 +1208,25 @@ bindsym Mod5+q workspace 1
                 self.assertIn('sway-border "pixel"', result.stdout)
                 self.assertIn("manual attention: none", result.stderr)
 
+    def test_for_window_preserves_inhibit_idle_as_a_map_time_command(self):
+        for mode in ["focus", "fullscreen", "open", "none", "visible"]:
+            with self.subTest(mode=mode):
+                result = self.translate(
+                    f'for_window [app_id="^mpv$"] inhibit_idle {mode}\n'
+                )
+                self.assertIn('match app-id="^mpv$"', result.stdout)
+                self.assertIn(
+                    f'sway-for-window-command "inhibit_idle {mode}"', result.stdout
+                )
+                self.assertIn("manual attention: none", result.stderr)
+
+        for command in ["inhibit_idle", "inhibit_idle always", "inhibit_idle open now"]:
+            with self.subTest(invalid=command):
+                result = self.translate(f'for_window [app_id="^mpv$"] {command}\n')
+                self.assertNotIn("sway-for-window-command", result.stdout)
+                self.assertIn("command needs manual conversion", result.stdout)
+                self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
     def test_for_window_criteria_accept_inline_regex_with_bracket_class(self):
         result = self.translate(
             'for_window [title="(?i)^picture[- ]in[- ]picture$"] '
