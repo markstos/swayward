@@ -821,6 +821,19 @@ class Translator:
                 )
                 return
             key = "+".join([*parts, f"code:{code}"])
+        elif all(self.translate_modifier(part) is not None for part in key.split("+")):
+            # sway folds every modifier name into the binding's mask and keeps
+            # a binding with no key (sway/sway/commands/bind.c:428-433). A KDL
+            # bind needs a trigger, so emitting the last modifier as one
+            # produces a config that `swayward validate` rejects.
+            self.warn(
+                source,
+                line,
+                rest,
+                "modifier-only bindings are unsupported; a swayward binding needs "
+                "a key or button (docs/KNOWN_DEVIATIONS.md#modifier-only-bindings)",
+            )
+            return
 
         command = command.strip()
         while command.startswith("--"):

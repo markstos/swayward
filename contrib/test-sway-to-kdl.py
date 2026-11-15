@@ -544,6 +544,45 @@ bindsym Mod5+q workspace 1
         self.assertIn("unsupported modifier Mod6", result.stdout)
         self.assertIn("manual attention: 1 directive(s)", result.stderr)
 
+    def test_modifier_only_bindsyms_fail_loud_instead_of_emitting_a_modifier_key(self):
+        reason = "modifier-only bindings are unsupported"
+        for directive in [
+            "bindsym Mod4 exec menu",
+            "bindsym Mod4+Shift exec menu",
+            "bindsym --release Super exec menu",
+            "bindsym Control+Mod1 nop both",
+        ]:
+            with self.subTest(directive=directive):
+                result = self.translate(f"{directive}\n")
+                self.assertIn(reason, result.stdout)
+                self.assertNotIn("command", result.stdout)
+                self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
+        # The modifier keysyms themselves are ordinary keys, not modifier names.
+        result = self.translate("bindsym Super_L exec menu\n")
+        self.assertIn('    Super_L { command "exec menu"; }', result.stdout)
+        self.assertIn("manual attention: none", result.stderr)
+
+        result = self.translate(
+            "set $mod Mod4\n"
+            'mode "resize" {\n'
+            "    bindsym $mod mode default\n"
+            "    bindsym Escape mode default\n"
+            "}\n"
+        )
+        self.assertIn(reason, result.stdout)
+        self.assertIn('    Escape { command "mode default"; }', result.stdout)
+        self.assertNotIn("    Mod4 {", result.stdout)
+        self.assertNotIn("    Super {", result.stdout)
+        self.assertIn("manual attention: 1 directive(s)", result.stderr)
+        binary = ROOT / "target" / "debug" / "swayward"
+        if binary.exists():
+            with tempfile.NamedTemporaryFile("w", suffix=".kdl") as config:
+                config.write(result.stdout)
+                config.flush()
+                subprocess.run([binary, "validate", "-c", config.name], check=True,
+                               capture_output=True)
+
     def test_floating_modifier_translates_independently_from_mod_key(self):
         for directive, expected in [
             ("floating_modifier Mod4", 'floating-modifier "Super"'),

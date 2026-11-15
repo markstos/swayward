@@ -202,6 +202,17 @@ unconditional process spawning, so it cannot preserve sway command dispatch,
 binding modes, `toggle`, `--locked`, or `--reload`. The translator reports
 `bindswitch` and `unbindswitch`.
 
+### Modifier-only bindings
+
+**Command gap.**
+
+Sway accepts a binding made only of modifiers, such as `bindsym Mod4 exec menu`:
+its parser adds each modifier name to the binding's modifier mask and keeps the
+binding with no key (`sway/sway/commands/bind.c:428-433`). A swayward binding
+needs a key, mouse button, or scroll trigger, so there is no KDL spelling for
+it. The translator reports these bindings rather than emitting one that
+`swayward validate` rejects. Bind a key together with the modifier instead.
+
 ## Bars
 
 Swayward does not implement sway's `bar {}` configuration or launch swaybar.
