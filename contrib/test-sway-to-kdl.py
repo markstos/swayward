@@ -1173,6 +1173,70 @@ bindsym Mod5+q workspace 1
         self.assertIn("needs manual conversion", result.stdout)
         self.assertNotIn("default-column-width", result.stdout)
 
+    def test_for_window_translates_keyword_and_one_dimension_resize_set(self):
+        width = "default-column-width"
+        height = "default-window-height"
+        for command, expected, absent in [
+            ("resize set width 1900", [f"{width} {{ fixed 1900; }}"], [height]),
+            ("resize set 1900 px", [f"{width} {{ fixed 1900; }}"], [height]),
+            ("resize set width 80 ppt", [f"{width} {{ proportion 0.8; }}"], [height]),
+            ("resize set height 600px", [f"{height} {{ fixed 600; }}"], [width]),
+            ("resize set height 50 ppt", [f"{height} {{ proportion 0.5; }}"], [width]),
+            (
+                "resize set width 766 px height 867 px",
+                [f"{width} {{ fixed 766; }}", f"{height} {{ fixed 867; }}"],
+                [],
+            ),
+            (
+                "resize set 766 height 867",
+                [f"{width} {{ fixed 766; }}", f"{height} {{ fixed 867; }}"],
+                [],
+            ),
+            (
+                "resize set width 40ppt height 30 ppt",
+                [f"{width} {{ proportion 0.4; }}", f"{height} {{ proportion 0.3; }}"],
+                [],
+            ),
+            # sway leaves a dimension alone when its amount is not positive.
+            ("resize set width 0 height 400", [f"{height} {{ fixed 400; }}"], [width]),
+            ("resize set 800 0", [f"{width} {{ fixed 800; }}"], [height]),
+        ]:
+            with self.subTest(command=command):
+                result = self.translate(f'for_window [app_id="foo"] {command}\n')
+                for line in expected:
+                    self.assertIn(line, result.stdout)
+                for name in absent:
+                    self.assertNotIn(name, result.stdout)
+                self.assertIn("manual attention: none", result.stderr)
+
+        for command in [
+            "resize set width 50 ppt height 400 px",
+            "resize set width",
+            "resize set height",
+            "resize set width 10 height 20 30",
+            "resize set 0 0",
+            "resize set width wide",
+        ]:
+            with self.subTest(invalid=command):
+                result = self.translate(f'for_window [app_id="foo"] {command}\n')
+                self.assertNotIn("window-rule {", result.stdout)
+                self.assertIn("needs manual conversion", result.stdout)
+                self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
+    def test_keyword_resize_set_rules_validate(self):
+        result = self.translate(
+            'for_window [app_id="a"] resize set width 80 ppt\n'
+            'for_window [app_id="b"] resize set height 600\n'
+            'for_window [app_id="c"] resize set width 766 px height 867 px\n'
+        )
+        binary = ROOT / "target" / "debug" / "swayward"
+        if binary.exists():
+            with tempfile.NamedTemporaryFile("w", suffix=".kdl") as config:
+                config.write(result.stdout)
+                config.flush()
+                subprocess.run([binary, "validate", "-c", config.name], check=True,
+                               capture_output=True)
+
     def test_for_window_preserves_sticky_as_a_map_time_command(self):
         for value in ["enable", "disable", "toggle"]:
             with self.subTest(value=value):

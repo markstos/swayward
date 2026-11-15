@@ -1125,6 +1125,44 @@ class Translator:
             return None
         return amounts[0][0], amounts[1][0]
 
+    def keyword_resize_set(self, words: list[str]) -> list[str] | None:
+        """Translate the `width`/`height` keyword and one-dimension forms.
+
+        sway accepts `resize set [width] <width> [px|ppt]`, `resize set height
+        <height> [px|ppt]` and both together, and leaves a dimension alone when
+        its amount is not positive (sway/sway/commands/resize.c:417-457).
+        """
+        if words[:2] != ["resize", "set"]:
+            return None
+        rest = words[2:]
+        if len(rest) >= 2 and rest[0] == "width" and rest[1] != "height":
+            rest = rest[1:]
+        split = rest.index("height") if "height" in rest else len(rest)
+        width = self.split_amounts(rest[:split])
+        height = self.split_amounts(rest[split + 1 :])
+        if split == len(rest) and width is not None and len(width) == 2:
+            width, height = width[:1], width[1:]
+        if width is None or height is None or len(width) > 1 or len(height) > 1:
+            return None
+        amounts = [
+            (name, value, unit)
+            for name, found in (
+                ("default-column-width", width),
+                ("default-window-height", height),
+            )
+            for value, unit in found
+            if value > 0
+        ]
+        # Mixed units stay fail-loud, as they do without the keywords.
+        if not amounts or len({unit for _, _, unit in amounts}) != 1:
+            return None
+        return [
+            f"    {name} {{ fixed {value}; }}"
+            if unit == "px"
+            else f"    {name} {{ proportion {value / 100:g}; }}"
+            for name, value, unit in amounts
+        ]
+
     def is_move_position_coordinates(self, words: list[str]) -> bool:
         if words[:2] != ["move", "position"]:
             return False
@@ -1249,18 +1287,6 @@ class Translator:
                         "resize size needs manual conversion",
                     )
             elif (
-                len(words) in {6, 7}
-                and words[:3] == ["resize", "set", "width"]
-                and words[4] == "height"
-                and words[3].isdigit()
-                and words[5].isdigit()
-                and (len(words) == 6 or words[6] == "px")
-            ):
-                effects += [
-                    f"    default-column-width {{ fixed {words[3]}; }}",
-                    f"    default-window-height {{ fixed {words[5]}; }}",
-                ]
-            elif (
                 resized := self.fixed_resize_set(words)
             ) is not None:
                 width, height = resized
@@ -1268,6 +1294,8 @@ class Translator:
                     f"    default-column-width {{ fixed {width}; }}",
                     f"    default-window-height {{ fixed {height}; }}",
                 ]
+            elif (sized := self.keyword_resize_set(words)) is not None:
+                effects += sized
             elif words == ["move", "position", "center"]:
                 effects.append(
                     f"    sway-for-window-command {self.quote('move position center')}"
