@@ -1125,6 +1125,29 @@ bindsym Mod5+q workspace 1
         self.assertIn("for_window [app_id=\"foo\"] exec nope", result.stdout)
         self.assertIn("manual attention: 1 directive(s)", result.stderr)
 
+    def test_for_window_ignores_empty_segments_of_a_command_list(self):
+        for command in [
+            "floating enable;",
+            "floating enable,",
+            "floating enable ; ",
+            "floating enable;; border pixel 2;",
+            "; floating enable",
+        ]:
+            with self.subTest(command=command):
+                result = self.translate(f'for_window [app_id="foo"] {command}\n')
+                self.assertIn("open-floating true", result.stdout)
+                self.assertNotIn("needs manual conversion", result.stdout)
+                self.assertIn("manual attention: none", result.stderr)
+
+        result = self.translate('for_window [app_id="foo"] exec nope;\n')
+        self.assertIn('for_window [app_id="foo"] exec nope', result.stdout)
+        self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
+        result = self.translate('for_window [app_id="foo"] ;\n')
+        self.assertNotIn("window-rule {", result.stdout)
+        self.assertIn("for_window needs a command", result.stdout)
+        self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
     def test_for_window_translates_floating_size_and_center_shape(self):
         result = self.translate(
             'for_window [app_id="foo"] floating enable, '
