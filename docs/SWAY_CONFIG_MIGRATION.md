@@ -116,6 +116,9 @@ for the parts that did not:
   translated. Wallpaper and unmatched output settings are reported.
 - **Window rules:** supported `for_window` effects with an `app_id` criterion
   become `window-rule` blocks. Other criteria or commands are reported.
+- **Seats:** `hide_cursor` and `xcursor_theme` on `seat *` or `seat seat0`
+  become the `cursor` block. Swayward has one seat, so other seat names and
+  every other seat directive are reported.
 - **Includes:** sway include globs are expanded during translation. Included sway
   directives are translated in place. Missing, repeated, or recursive files are
   reported. Includes that use command substitution, such as Fedora's stock

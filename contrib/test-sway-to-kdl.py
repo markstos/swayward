@@ -1378,6 +1378,80 @@ bindsym Mod5+q workspace 1
                 self.assertIn(reason, result.stdout)
                 self.assertIn("manual attention: 1 directive(s)", result.stderr)
 
+    def test_seat_cursor_settings_translate_to_the_cursor_block(self):
+        result = self.translate(
+            "seat * hide_cursor 5000\n"
+            "seat * xcursor_theme Adwaita 32\n"
+            "seat seat0 hide_cursor when-typing enable\n"
+        )
+        self.assertIn(
+            "cursor {\n"
+            "    hide-after-inactive-ms 5000\n"
+            '    xcursor-theme "Adwaita"\n'
+            "    xcursor-size 32\n"
+            "    hide-when-typing\n"
+            "}\n",
+            result.stdout,
+        )
+        self.assertIn("manual attention: none", result.stderr)
+        binary = ROOT / "target" / "debug" / "swayward"
+        if binary.exists():
+            with tempfile.NamedTemporaryFile("w", suffix=".kdl") as config:
+                config.write(result.stdout)
+                config.flush()
+                subprocess.run([binary, "validate", "-c", config.name], check=True,
+                               capture_output=True)
+
+        # sway raises a short timeout to 100 ms, resets an unnamed size to 24,
+        # and lets a later directive win.
+        result = self.translate(
+            "seat * {\n"
+            "    hide_cursor 50\n"
+            "    xcursor_theme Big 48\n"
+            "    xcursor_theme Small\n"
+            "    hide_cursor when-typing enable\n"
+            "    hide_cursor when-typing disable\n"
+            "}\n"
+        )
+        self.assertIn("    hide-after-inactive-ms 100\n", result.stdout)
+        self.assertIn('    xcursor-theme "Small"\n', result.stdout)
+        self.assertIn("    xcursor-size 24\n", result.stdout)
+        self.assertNotIn("Big", result.stdout)
+        self.assertNotIn("hide-when-typing", result.stdout)
+        self.assertIn("manual attention: none", result.stderr)
+
+        result = self.translate("seat * hide_cursor 3000\nseat * hide_cursor 0\n")
+        self.assertNotIn("cursor {", result.stdout)
+        self.assertIn("manual attention: none", result.stderr)
+
+    def test_untranslatable_seat_directives_stay_fail_loud(self):
+        for source, reason in [
+            ("seat * attach 1:2:mouse\n", "unsupported seat directive"),
+            ("seat * fallback true\n", "unsupported seat directive"),
+            ("seat * hide_cursor\n", "unsupported seat directive"),
+            ("seat * hide_cursor soon\n", "Expected an integer timeout"),
+            (
+                "seat * hide_cursor typing enable\n",
+                "Expected 'hide_cursor <timeout>|when-typing [enable|disable]'",
+            ),
+            ("seat * xcursor_theme Big 300\n", "cursor size must be between 1 and 255"),
+            ("seat * xcursor_theme Big large\n", "cursor size must be between 1 and 255"),
+            ("seat left hide_cursor 3000\n", "swayward has one seat"),
+            ("seat - xcursor_theme Adwaita\n", "swayward has one seat"),
+        ]:
+            with self.subTest(source=source):
+                result = self.translate(source)
+                self.assertNotIn("cursor {", result.stdout)
+                self.assertIn(reason, result.stdout)
+                self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
+        result = self.translate(
+            "seat seat0 {\n    hide_cursor 2000\n    attach 1:2:mouse\n}\n"
+        )
+        self.assertIn("    hide-after-inactive-ms 2000\n", result.stdout)
+        self.assertIn(":3: unsupported seat directive: seat seat0 attach", result.stdout)
+        self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
     def test_focus_follows_mouse_maps_exact_modes_and_refuses_always(self):
         result = self.translate("focus_follows_mouse no\n")
         self.assertNotIn("focus-follows-mouse", result.stdout)

@@ -54,6 +54,7 @@ class Translator:
         self.titlebar_padding: tuple[int, int] | None = None
         self.titlebar_border_thickness: int | None = None
         self.urgent_timeout_ms: int | None = None
+        self.cursor_settings: dict[str, str] = {}
         self.manual: list[str] = []
         self.visited: set[Path] = set()
 
@@ -175,6 +176,17 @@ class Translator:
             elif match := re.match(r"output\s+(\S+)\s+(.+)", text):
                 self.translate_device_block(
                     path, line_no, "output", match.group(1), [match.group(2)]
+                )
+            elif match := re.match(r"seat\s+(\S+)\s*\{", text):
+                block, index = self.block(lines, index, text)
+                self.translate_seat(
+                    path,
+                    match.group(1),
+                    list(enumerate(block[1:-1], line_no + 1)),
+                )
+            elif match := re.fullmatch(r"seat\s+(\S+)\s+(.+)", text):
+                self.translate_seat(
+                    path, match.group(1), [(line_no, match.group(2))]
                 )
             elif match := re.match(r"(bindsym|bindcode)\s+(.+)", text):
                 self.translate_bind(path, line_no, match.group(1), match.group(2))
@@ -687,6 +699,75 @@ class Translator:
             depth += line.count("{") - line.count("}")
             index += 1
         return block, index
+
+    def translate_seat(
+        self, source: Path, seat: str, body: list[tuple[int, str]]
+    ) -> None:
+        """Translate the cursor settings of sway's seat configuration.
+
+        swayward has one seat and refuses the `seat` command namespace, so only
+        the two directives its `cursor` block covers translate, and only for a
+        selector that reaches the default seat.
+        """
+        for at, item in body:
+            item = self.expand(item.strip()).replace(r"\$", "$")
+            if not item or item.startswith("#"):
+                continue
+            text = f"seat {seat} {item}"
+            words = item.split()
+            if words[0] not in {"hide_cursor", "xcursor_theme"}:
+                self.warn(source, at, text, "unsupported seat directive")
+            elif seat not in {"*", "seat0"}:
+                self.warn(
+                    source,
+                    at,
+                    text,
+                    "swayward has one seat; only seat * and seat seat0 translate",
+                )
+            elif words[0] == "hide_cursor" and len(words) == 2:
+                # sway raises a non-zero timeout below 100 ms to 100 ms, and 0
+                # switches the timeout off
+                # (sway/sway/commands/seat/hide_cursor.c:24-32).
+                if re.fullmatch(r"\d+", words[1]) is None:
+                    self.warn(source, at, text, "Expected an integer timeout")
+                elif (timeout := int(words[1])) == 0:
+                    self.cursor_settings.pop("hide-after-inactive-ms", None)
+                else:
+                    self.cursor_settings["hide-after-inactive-ms"] = (
+                        f"    hide-after-inactive-ms {max(timeout, 100)}"
+                    )
+            elif words[0] == "hide_cursor" and len(words) == 3:
+                if words[1] != "when-typing":
+                    self.warn(
+                        source,
+                        at,
+                        text,
+                        "Expected 'hide_cursor <timeout>|when-typing [enable|disable]'",
+                    )
+                elif words[2].lower() in {
+                    "1", "yes", "on", "true", "enable", "enabled", "active"
+                }:
+                    self.cursor_settings["hide-when-typing"] = "    hide-when-typing"
+                else:
+                    self.cursor_settings.pop("hide-when-typing", None)
+            elif words[0] == "xcursor_theme" and len(words) in {2, 3}:
+                # sway resets the size to 24 when the directive names none
+                # (sway/sway/commands/seat/xcursor_theme.c:18-32).
+                size = words[2] if len(words) == 3 else "24"
+                # swayward stores the cursor size in a u8.
+                if re.fullmatch(r"\d+", size) is None or not 0 < int(size) <= 255:
+                    self.warn(
+                        source, at, text, "cursor size must be between 1 and 255"
+                    )
+                else:
+                    self.cursor_settings["xcursor-theme"] = (
+                        f"    xcursor-theme {self.quote(words[1].strip(chr(34)))}"
+                    )
+                    self.cursor_settings["xcursor-size"] = (
+                        f"    xcursor-size {int(size)}"
+                    )
+            else:
+                self.warn(source, at, text, "unsupported seat directive")
 
     def refuse_unsupported_binding(self, source: Path, line: int, text: str) -> None:
         directive = text.split(None, 1)[0]
@@ -1769,6 +1850,8 @@ class Translator:
                 else:
                     output += [f"    {item}" for item in settings]
             output += ["}"]
+        if self.cursor_settings:
+            output += ["", "cursor {", *self.cursor_settings.values(), "}"]
         if self.blur_settings:
             output += [
                 "",
