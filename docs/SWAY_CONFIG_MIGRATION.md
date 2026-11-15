@@ -9,6 +9,12 @@ swayward-sway-to-kdl ~/.config/sway/config >~/.config/swayward/config.kdl
 swayward validate -c ~/.config/swayward/config.kdl
 ```
 
+`swayward validate` also parses the sway command in every bind and
+`sway-for-window-command`, and fails on one that would be refused as invalid
+when run. Sway reads a binding's command only when the key is pressed, so this
+can report a typo that sway has been loading without complaint. A command that
+uses a `$variable` is not checked.
+
 `swayward-sway-to-kdl` installs with swayward and needs Python. From a source
 checkout it is `contrib/sway-to-kdl`. Cargo is not required either way.
 

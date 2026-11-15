@@ -73,7 +73,18 @@ fn run_subcommand(subcommand: Option<Sub>) -> Result<bool, Box<dyn std::error::E
             Sub::Validate { config } => {
                 tracy_client::Client::start();
 
-                config_path(config).load().config?;
+                let config = config_path(config).load().config?;
+                // Command strings are opaque to the KDL decoder; without this
+                // a bad one is first reported when its key is pressed.
+                let invalid = config.invalid_sway_commands();
+                for command in &invalid {
+                    error!("{command}");
+                }
+                if !invalid.is_empty() {
+                    return Err(
+                        format!("config has {} invalid sway command(s)", invalid.len()).into(),
+                    );
+                }
                 info!("config is valid");
                 return Ok(true);
             }
