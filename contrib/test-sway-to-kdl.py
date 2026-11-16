@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import difflib
 import functools
+import importlib.machinery
+import importlib.util
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 import tempfile
@@ -1805,6 +1808,799 @@ for _name in [n for n in vars(TranslatorTests) if n.startswith("test_")]:
     setattr(
         TranslatorTests, _name, checking_stale_goldens(getattr(TranslatorTests, _name))
     )
+
+
+def load_script():
+    # The script has no .py suffix, so spec_from_file_location needs a loader.
+    loader = importlib.machinery.SourceFileLoader("sway_to_kdl", str(SCRIPT))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    # dataclasses resolves annotations through sys.modules on Python 3.9.
+    sys.modules[loader.name] = module
+    loader.exec_module(module)
+    return module
+
+
+# Case tables for the lexer ports, derived from reading sway 1.12's
+# common/stringop.c and sway/commands.c:205-335. Inputs are raw strings so a
+# backslash in a case is one backslash in the input.
+
+SPLIT_ARGS_CASES = [
+    ("", []),
+    ("   ", []),
+    ("a b", ["a", "b"]),
+    ("  a \t\n\f\v\r b  ", ["a", "b"]),
+    ('a "b c" d', ["a", '"b c"', "d"]),
+    ("a 'b c' d", ["a", "'b c'", "d"]),
+    ('"it\'s" x', ['"it\'s"', "x"]),
+    ("'say \"hi\"' x", ["'say \"hi\"'", "x"]),
+    ('a"b c"d e', ['a"b c"d', "e"]),
+    # A backslash makes the next character literal, whitespace included, and
+    # stays in the token; a second backslash toggles the escape off.
+    (r"a\ b c", [r"a\ b", "c"]),
+    (r'"a\"b c" d', [r'"a\"b c"', "d"]),
+    (r"a\\ b", [r"a\\", "b"]),
+    (r"a\\\ b", [r"a\\\ b"]),
+    (r"\"a b", [r'\"a', "b"]),
+    # Brackets are one level deep, and only outside quotes.
+    ('[app_id="a b"] kill', ['[app_id="a b"]', "kill"]),
+    ("[a [b c] d", ["[a [b c]", "d"]),
+    ("[a] ]b c", ["[a]", "]b", "c"]),
+    ("a[b c]d e", ["a[b c]d", "e"]),
+    ('"[" a', ['"["', "a"]),
+    (r"\[a b]", [r"\[a", "b]"]),
+    # Unterminated runs end at the end of input.
+    ('a "b c', ["a", '"b c']),
+    ("a 'b c", ["a", "'b c"]),
+    ("[x y", ["[x y"]),
+    ("a\\", ["a\\"]),
+    ("x {", ["x", "{"]),
+    ("a\0b c", ["a"]),
+]
+
+STRIP_QUOTES_CASES = [
+    ('"a b"', "a b"),
+    ("'a b'", "a b"),
+    ('"it\'s"', "it's"),
+    ("'say \"hi\"'", 'say "hi"'),
+    ('a"b"c', "abc"),
+    ('"a" \'b\'', "a b"),
+    ('""', ""),
+    ('"unterminated', "unterminated"),
+    # Backslashes stay; an escaped quote stays; the escape toggles.
+    (r'"a\"b"', r"a\"b"),
+    (r'\"a', r'\"a'),
+    (r'\\"a"', r"\\a"),
+    ("plain", "plain"),
+    ('"a"\0"b"', "a"),
+]
+
+# (input, delims, (segment, matched, rest))
+ARGSEP_CASES = [
+    ("a;b", ";,", ("a", ";", "b")),
+    ("a,b", ";,", ("a", ",", "b")),
+    ("a", ";,", ("a", "", None)),
+    ("", ";,", ("", "", None)),
+    (";", ";,", ("", "", None)),
+    (";;a;b", ";,", ("a", ";", "b")),
+    (",;a", ";,", ("a", "", None)),
+    ("a;", ";,", ("a", ";", "")),
+    (" ; a", ";,", (" ", ";", " a")),
+    ('"a;b";c', ";,", ('"a;b"', ";", "c")),
+    ("'a;b';c", ";,", ("'a;b'", ";", "c")),
+    ("'a\"b';c", ";,", ("'a\"b'", ";", "c")),
+    ('a "b;c', ";,", ('a "b;c', "", None)),
+    (r"a\;b;c", ";,", (r"a\;b", ";", "c")),
+    (r"a\\;b", ";,", (r"a\\", ";", "b")),
+    (r"a\ ;b", ";,", (r"a\ ", ";", "b")),
+    # The escape survives an escaped character when the next interesting
+    # character is adjacent: the ';' after \" is escaped too.
+    (r'a\";b', ";,", (r'a\";b', "", None)),
+    (r'a\"x;b', ";,", (r'a\"x', ";", "b")),
+    (r"a\;;b", ";,", (r"a\;;b", "", None)),
+    (r'a\"\";b', ";,", (r'a\"\";b', "", None)),
+    # argsep knows nothing of brackets.
+    ("[x=1;] y;z", ";,", ("[x=1", ";", "] y;z")),
+    ("a b", " ", ("a", " ", "b")),
+    ("a;\0b", ";,", ("a", ";", "")),
+]
+
+UNESCAPE_CASES = [
+    ("plain", "plain"),
+    (r"a\nb", "a\nb"),
+    (r"\t\r\f\v\a\b", "\t\r\f\v\a\b"),
+    (r"\'\"\?", "'\"?"),
+    (r"a\\b", r"a\b"),
+    (r"\\\\", r"\\"),
+    (r"\\n", r"\n"),
+    (r"\q", r"\q"),
+    ("a\\", "a\\"),
+    # \0 returns before the holes are shifted out.
+    (r"a\0b", "a"),
+    (r"a\tb\0c", "a\t"),
+    (r"\n\0", "\n"),
+    # \x reads up to two decimal digits as hex and ends the scan.
+    (r"\x41", "A"),
+    (r"\x4", "\x04"),
+    (r"\x41\n", "A\\n"),
+    (r"\x4\n", "\x04\\n"),
+    (r"\x4a\n", "\x04a\\n"),
+    (r"\xa\n", "a\n"),
+    (r"\x00b", "b"),
+    (r"\x", ""),
+    ("a\0\\n", "a"),
+]
+
+JOIN_ARGS_CASES = [
+    (["a"], "a"),
+    (["a", "b c"], "a b c"),
+    (["", "x"], " x"),
+]
+
+# (input, [(criteria, argv), ...])
+COMMAND_LIST_CASES = [
+    ("", []),
+    (" ; ,; ", []),
+    ("kill", [(None, ["kill"])]),
+    ("  a  ", [(None, ["a"])]),
+    ("floating enable;", [(None, ["floating", "enable"])]),
+    ("a,", [(None, ["a"])]),
+    ("a;;b", [(None, ["a"]), (None, ["b"])]),
+    ("a; ;b", [(None, ["a"]), (None, ["b"])]),
+    ("a , b", [(None, ["a"]), (None, ["b"])]),
+    (
+        '[app_id="a b"] kill; focus',
+        [('[app_id="a b"]', ["kill"]), (None, ["focus"])],
+    ),
+    (
+        '[app_id="x"] floating enable, resize set 10 10',
+        [
+            ('[app_id="x"]', ["floating", "enable"]),
+            ('[app_id="x"]', ["resize", "set", "10", "10"]),
+        ],
+    ),
+    (
+        "[app_id=x] a, b; c",
+        [("[app_id=x]", ["a"]), ("[app_id=x]", ["b"]), (None, ["c"])],
+    ),
+    # Criteria are only parsed after ';' (or at the start).
+    (
+        '[app_id="x"] a, [title="y"] b',
+        [('[app_id="x"]', ["a"]), ('[app_id="x"]', ['[title="y"]', "b"])],
+    ),
+    ("a, ;[app_id=x] b", [(None, ["a"]), (None, ["[app_id=x]", "b"])]),
+    # The criteria are cut before argsep, so a ';' inside them is fine, and
+    # argsep skips a ';' straight after them.
+    ('[title="a;b"] kill', [('[title="a;b"]', ["kill"])]),
+    ("[app_id=x];kill", [("[app_id=x]", ["kill"])]),
+    (r'[title="a\"b"] kill', [(r'[title="a\"b"]', ["kill"])]),
+    ("[floating] kill", [("[floating]", ["kill"])]),
+    ("[app_id=x]", []),
+    ('exec "a; b"; c', [(None, ["exec", '"a; b"']), (None, ["c"])]),
+    ('title_format "a, b"', [(None, ["title_format", '"a, b"'])]),
+    (r"exec echo a\;b", [(None, ["exec", "echo", r"a\;b"])]),
+]
+
+CRITERIA_ERROR_CASES = [
+    ('[app_id="x] kill', "Quote mismatch in criteria"),
+    ("[app_id=x kill", "No closing brace found in criteria"),
+    ("[] kill", "Criteria is empty"),
+    ("[ ] kill", "Token '' is not recognized"),
+    ("[Foo=x] kill", "Token '' is not recognized"),
+    ("a; [app_id=x", "No closing brace found in criteria"),
+]
+
+
+class LexerTests(unittest.TestCase):
+    """The lexer ports, called directly; no translator run, so no goldens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.lexer = load_script()
+
+    def test_split_args(self):
+        for source, expected in SPLIT_ARGS_CASES:
+            with self.subTest(source=source):
+                self.assertEqual(self.lexer.split_args(source), expected)
+
+    def test_strip_quotes(self):
+        for source, expected in STRIP_QUOTES_CASES:
+            with self.subTest(source=source):
+                self.assertEqual(self.lexer.strip_quotes(source), expected)
+
+    def test_argsep(self):
+        for source, delims, expected in ARGSEP_CASES:
+            with self.subTest(source=source, delims=delims):
+                self.assertEqual(self.lexer.argsep(source, delims), expected)
+
+    def test_unescape_string(self):
+        for source, expected in UNESCAPE_CASES:
+            with self.subTest(source=source):
+                self.assertEqual(self.lexer.unescape_string(source), expected)
+
+    def test_join_args(self):
+        for args, expected in JOIN_ARGS_CASES:
+            with self.subTest(args=args):
+                self.assertEqual(self.lexer.join_args(args), expected)
+        with self.assertRaises(ValueError):
+            self.lexer.join_args([])
+
+    def test_split_command_list(self):
+        for source, expected in COMMAND_LIST_CASES:
+            with self.subTest(source=source):
+                commands = self.lexer.split_command_list(source)
+                self.assertEqual(
+                    [(command.criteria, command.argv) for command in commands],
+                    expected,
+                )
+
+    def test_split_command_list_rejects_bad_criteria(self):
+        for source, message in CRITERIA_ERROR_CASES:
+            with self.subTest(source=source):
+                with self.assertRaises(self.lexer.CriteriaError) as caught:
+                    self.lexer.split_command_list(source)
+                self.assertEqual(str(caught.exception), message)
+
+
+
+# Case tables for read_config, derived from reading sway 1.12's sway/config.c
+# (read_config :732-869, getline_with_cont :666-694, detect_brace :696-717,
+# expand_line :719-729) and sway/commands.c:355-366. A Line is shaped as
+# (first line, text) and a Block as (first line, header text, body, end text).
+
+READ_CONFIG_CASES = [
+    # Continuation keeps the next line's leading whitespace.
+    ("a \\\n  b\n", [(1, "a   b")]),
+    ("a\\\nb\\\nc\nd\n", [(1, "abc"), (4, "d")]),
+    ("\\\nb\n", [(1, "b")]),
+    # Only a "\" right before "\n" continues; at EOF or before "\r" it stays.
+    ("a \\", [(1, "a \\")]),
+    ("a \\\n", [(1, "a \\")]),
+    ("a\\\r\nb\n", [(1, "a\\"), (2, "b")]),
+    ("a \\ \nb\n", [(1, "a \\"), (2, "b")]),
+    # A line whose first byte is "#" does not continue; an indented one
+    # does, and then swallows the next line into the comment.
+    ("# c \\\nb\n", [(2, "b")]),
+    ("  # c \\\nb\nd\n", [(3, "d")]),
+    # Blank lines and comments are skipped; a later "#" is text.
+    ("a\n\n \t \n# c\n  # d\nb # not a comment\n", [(1, "a"), (6, "b # not a comment")]),
+    # The logical line ends at a NUL; non-UTF-8 bytes survive.
+    ("a\0b\n\0c\nd\n", [(1, "a"), (3, "d")]),
+    ("a \udcff\n", [(1, "a \udcff")]),
+    # A last split_args token of "{" opens a block, with two tokens or more.
+    ("bar {\n  a\n}\n", [(1, "bar", [(2, "a")], "}")]),
+    ("\tbar\t\t{ \n}\n", [(1, "bar", [], "}")]),
+    ('mode "x y" {\n}\n', [(1, 'mode "x y"', [], "}")]),
+    ("{\na\n}\n", [(1, "{"), (2, "a"), (3, "}")]),
+    ("bar{\na\n}\n", [(1, "bar{"), (2, "a"), (3, "}")]),
+    ('exec "a {"\n', [(1, 'exec "a {"')]),
+    ("bar \\{\n", [(1, "bar \\{")]),
+    ("bar \\\\ {\n}\n", [(1, "bar \\\\", [], "}")]),
+    ("\\   {\n}\n", [(1, "\\ ", [], "}")]),
+    ("bar { # c\n}\n", [(1, "bar { # c"), (2, "}")]),
+    # A continuation can form the header.
+    ("bar \\\n{\n a\n}\n", [(1, "bar", [(3, "a")], "}")]),
+    # detect_brace: a line not ending in "{" or "}" takes the next nonblank
+    # line when it is exactly "{", skipping blank lines but not comments.
+    ("bar\n\n  {  \n a\n}\n", [(1, "bar", [(4, "a")], "}")]),
+    ("bar\n# c\n{\na\n}\n", [(1, "bar"), (3, "{"), (4, "a"), (5, "}")]),
+    ("bar\n{ a\n}\n", [(1, "bar"), (2, "{ a"), (3, "}")]),
+    ("bar\n\n\n", [(1, "bar")]),
+    ("bar\n{ \\\n}\n", [(1, "bar"), (2, "{ }")]),
+    ("bar}\n{\n}\n", [(1, "bar}"), (2, "{"), (3, "}")]),
+    # The " {" joins before splitting: an open quote swallows it.
+    ('x "abc\n{\nb\n', [(1, 'x "abc {'), (3, "b")]),
+    # A last token of "}" closes the innermost block, whatever precedes it.
+    ("bar {\na\nfoo }\nb\n", [(1, "bar", [(2, "a")], "foo }"), (4, "b")]),
+    ("a b}\n", [(1, "a b}")]),
+    # X { a } on one line is not a block. At top level it is an unmatched
+    # "}" (config.c:842-846); inside a block it closes that block.
+    ("X { a }\n", [(1, "X { a }")]),
+    ("}\n", [(1, "}")]),
+    ("mode m {\nX { a }\nb\n}\n", [(1, "mode m", [], "X { a }"), (3, "b"), (4, "}")]),
+    # Nested blocks, and a lone "{" inside a block, whose prefix supplies
+    # the first token.
+    (
+        "bar {\n colors {\n  a\n }\n b\n}\n",
+        [(1, "bar", [(2, "colors", [(3, "a")], "}"), (5, "b")], "}")],
+    ),
+    ("bar {\n{\na\n}\n}\n", [(1, "bar", [(2, "", [(3, "a")], "}")], "}")]),
+    ("bar {\nx\n{\n}\n}\n", [(1, "bar", [(2, "x", [], "}")], "}")]),
+    # A block still open at the end of the file ends there, with no end.
+    ("bar {\na\n", [(1, "bar", [(2, "a")], None)]),
+    ("bar {\nc {\n", [(1, "bar", [(2, "c", [], None)], None)]),
+]
+
+# What read_config hands config_command, with expand_line's prefix.
+FLATTEN_CASES = [
+    (
+        'mode "x" {\nbindsym a nop\n}\n',
+        ['mode "x" {', 'mode "x" bindsym a nop', 'mode "x" }'],
+    ),
+    (
+        "bar   {\n colors\n {\n  a  b\n }\n}\n",
+        ["bar {", "bar colors {", "bar colors a  b", "bar colors }", "bar }"],
+    ),
+    ("bar {\n{\na\n}\n}\n", ["bar {", "bar  {", "bar a", "bar }", "bar }"]),
+    ("X { a }\nb\n", ["X { a }", "b"]),
+]
+
+
+class ReaderTests(unittest.TestCase):
+    """read_config and LegacyReader, called directly; no goldens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reader = load_script()
+
+    def read(self, source, name="config"):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / name
+        path.write_bytes(source.encode("utf-8", "surrogateescape"))
+        return path, self.reader.read_config(path)
+
+    def shape(self, nodes):
+        shaped = []
+        for node in nodes:
+            if isinstance(node, self.reader.Line):
+                shaped.append((node.pos.line, node.text))
+            else:
+                end = node.end.text if node.end is not None else None
+                shaped.append(
+                    (node.header.pos.line, node.header.text, self.shape(node.body), end)
+                )
+        return shaped
+
+    def test_read_config(self):
+        for source, expected in READ_CONFIG_CASES:
+            with self.subTest(source=source):
+                self.assertEqual(self.shape(self.read(source)[1]), expected)
+
+    def test_flatten_prefixes_block_names(self):
+        for source, expected in FLATTEN_CASES:
+            with self.subTest(source=source):
+                nodes = self.read(source)[1]
+                self.assertEqual(
+                    [text for _, text in self.reader.flatten(nodes)], expected
+                )
+
+    def test_read_config_keeps_physical_lines(self):
+        path, nodes = self.read(
+            "a \\\n  b\nbar\n\n {\n  # c\n\n  x {\n  y\n  }\n}\nz\n"
+        )
+        line, block, last = nodes
+        self.assertEqual(line.raw, ("a \\", "  b"))
+        self.assertEqual(line.pos, self.reader.Pos(path, 1))
+        self.assertEqual(block.header.raw, ("bar", "", " {"))
+        self.assertEqual(
+            block.raw,
+            ("bar", "", " {", "  # c", "", "  x {", "  y", "  }", "}"),
+        )
+        self.assertEqual(block.body[0].raw, ("  x {", "  y", "  }"))
+        self.assertEqual(block.end.raw, ("}",))
+        self.assertEqual(block.end.pos.line, 11)
+        self.assertEqual(last.raw, ("z",))
+
+    def test_read_config_raw_of_open_block_runs_to_eof(self):
+        nodes = self.read("bar {\na\n\n# c\n")[1]
+        self.assertEqual(nodes[0].raw, ("bar {", "a", "", "# c"))
+
+    def test_legacy_reader_joins_and_counts_braces(self):
+        path = Path("config")
+        reader = self.reader.LegacyReader(
+            path, ["a \\", "   b", "", "# c", "x {", ' "{" \\', "", "}", "}", "z"]
+        )
+        line = reader.next_line()
+        self.assertEqual((line.text, line.raw, line.pos.line), ("a  b", ("a \\", "   b"), 1))
+        line = reader.next_line()
+        self.assertEqual(line.text, "x {")
+        block = reader.take_block("x {")
+        self.assertEqual(block.raw, ("x {", '"{" \\', "", "}", "}"))
+        self.assertEqual(block.header.text, "x")
+        self.assertEqual(block.header.pos.line, 5)
+        self.assertEqual(
+            [(body.pos.line, body.text, body.raw) for body in block.body],
+            [(6, '"{" \\', (' "{" \\',)), (7, "", ("",)), (8, "}", ("}",))],
+        )
+        self.assertEqual((block.end.pos.line, block.end.text), (9, "}"))
+        self.assertEqual(reader.next_line().text, "z")
+        self.assertIsNone(reader.next_line())
+
+    def test_legacy_reader_block_without_body(self):
+        reader = self.reader.LegacyReader(Path("config"), ["bar { }", "a"])
+        reader.next_line()
+        block = reader.take_block("bar { }")
+        self.assertEqual((block.raw, block.body, block.end), (("bar { }",), [], None))
+        self.assertEqual(reader.next_line().text, "a")
+
+
+class IRTests(unittest.TestCase):
+    """The KDL IR and renderer, called directly; no goldens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.s2k = load_script()
+
+    def names(self, node):
+        return [(child.name, child.args) for child in node.children]
+
+    def test_add_set_and_put_order_children(self):
+        Node = self.s2k.Node
+        node = Node("x", children=[Node("a", [1]), Node("b"), Node("a", [2])])
+        node.add(Node("b", [3]))
+        self.assertEqual(self.names(node), [("a", [1]), ("b", []), ("a", [2]), ("b", [3])])
+        node.set(Node("a", [4]))  # drop every "a", append
+        self.assertEqual(self.names(node), [("b", []), ("b", [3]), ("a", [4])])
+        node.put(Node("b", [5]))  # replace the first "b" in place
+        self.assertEqual(self.names(node), [("b", [5]), ("b", [3]), ("a", [4])])
+        node.put(Node("c"))
+        self.assertEqual(node.get("c").args, [])
+        node.put(Node("d"), "c")  # an alias names the same slot
+        self.assertEqual([child.name for child in node.children], ["b", "b", "a", "d"])
+        self.assertEqual(node.get("b").args, [5])
+        self.assertIsNone(node.get("c"))
+
+    def test_render_quotes_values_and_shapes_nodes(self):
+        s2k = self.s2k
+        Node, Comment, Raw = s2k.Node, s2k.Comment, s2k.Raw
+        node = Node(
+            "rule",
+            ["é \"q\"", 3, 1.0, 0.25, True, Raw("007")],
+            [("k", False), ("k", "v")],
+            [
+                Comment("note"),
+                Node("36", children=[Node("command", ["x"])], inline=True),
+                Node("empty", block=True),
+                Node("leaf"),
+            ],
+        )
+        self.assertEqual(
+            s2k.render_item(node, 1),
+            [
+                '    rule "é \\"q\\"" 3 1.0 0.25 true 007 k=false k="v" {',
+                "        // note",
+                '        "36" { command "x"; }',
+                "        empty {",
+                "        }",
+                "        leaf",
+                "    }",
+            ],
+        )
+
+    def test_render_keeps_the_group_order(self):
+        s2k = self.s2k
+        doc = s2k.Document()
+        doc.body.add(s2k.Node("spawn-sh-at-startup", ["a"]))
+        doc.urgent_timeout = s2k.Node("urgent-timeout-ms", [5])
+        doc.body.add(s2k.Node("spawn-sh-at-startup", ["b"]))
+        doc.device("touchpad")
+        doc.input.add(s2k.Node("tiling-drag", [False]))
+        doc.titlebar.alignment = "left"
+        doc.layout.add(s2k.Node("gaps", [1]))
+        self.assertEqual(
+            s2k.render(doc).split("\n")[3:],
+            [
+                "",
+                "input {",
+                "    focus-follows-mouse",
+                "    tiling-drag false",
+                "    touchpad {",
+                "    }",
+                "}",
+                "",
+                "layout {",
+                "    gaps 1",
+                "    titlebar {",
+                '        alignment "left"',
+                "    }",
+                "}",
+                "",
+                'spawn-sh-at-startup "a"',
+                'spawn-sh-at-startup "b"',
+                "urgent-timeout-ms 5",
+                "",
+            ],
+        )
+
+
+# The struct that decodes each SINGULAR parent, under swayward-config/src.
+# "" (the top level) is decoded by hand in decode.rs and checked separately;
+# binds, mode and default-column-width decode by hand and have no entry.
+SINGULAR_STRUCTS = {
+    "input": ("input/mod.rs", "InputPart"),
+    "keyboard": ("input/keyboard.rs", "KeyboardPart"),
+    "xkb": ("input/keyboard.rs", "Xkb"),
+    "touchpad": ("input/libinput.rs", "Touchpad"),
+    "mouse": ("input/libinput.rs", "Mouse"),
+    "tablet": ("input/tablet.rs", "Tablet"),
+    "touch": ("input/tablet.rs", "Touch"),
+    "layout": ("layout.rs", "LayoutPart"),
+    "outer-gaps": ("layout.rs", "OuterGapsPart"),
+    "titlebar": ("appearance/titlebar.rs", "TitlebarPart"),
+    "focused": ("appearance/titlebar.rs", "TitlebarColorsPart"),
+    "focused-inactive": ("appearance/titlebar.rs", "TitlebarColorsPart"),
+    "focused-tab-title": ("appearance/titlebar.rs", "TitlebarColorsPart"),
+    "unfocused": ("appearance/titlebar.rs", "TitlebarColorsPart"),
+    "urgent": ("appearance/titlebar.rs", "TitlebarColorsPart"),
+    "blur": ("appearance/effects.rs", "BlurPart"),
+    "background-effect": ("appearance/effects.rs", "BackgroundEffectRule"),
+    "shadow": ("appearance/border.rs", "ShadowRule"),
+    "window-rule": ("window_rule.rs", "WindowRule"),
+    "layer-rule": ("layer_rule.rs", "LayerRule"),
+    "workspace": ("workspace.rs", "Workspace"),
+    "output": ("output.rs", "Output"),
+    "clipboard": ("misc.rs", "ClipboardPart"),
+    "xwayland-satellite": ("misc.rs", "XwaylandSatellitePart"),
+}
+
+CONFIG_SRC = ROOT / "swayward-config" / "src"
+
+
+RAW_STRING_START = re.compile(r'b?r(#*)"')
+
+
+def strip_rust_comments(text):
+    """text with its `//` and (nested) `/* */` comments blanked out.
+
+    A comment becomes a space, or the newlines it spans, so line numbers
+    hold. String, raw string and character literals are kept, so a `//`
+    inside one is text. A `'` that does not close a one-character literal
+    starts a lifetime.
+    """
+    out = []
+    index = 0
+    while index < len(text):
+        raw = RAW_STRING_START.match(text, index)
+        if raw and (index == 0 or not re.match(r"\w", text[index - 1])):
+            close = text.find('"' + raw.group(1), raw.end())
+            end = len(text) if close < 0 else close + 1 + len(raw.group(1))
+            out.append(text[index:end])
+            index = end
+        elif text.startswith("//", index):
+            end = text.find("\n", index)
+            index = len(text) if end < 0 else end
+            out.append(" ")
+        elif text.startswith("/*", index):
+            start = index
+            depth = 0
+            while index < len(text):
+                if text.startswith("/*", index):
+                    depth += 1
+                    index += 2
+                elif text.startswith("*/", index):
+                    depth -= 1
+                    index += 2
+                    if not depth:
+                        break
+                else:
+                    index += 1
+            out.append("\n" * text.count("\n", start, index) or " ")
+        elif text[index] == '"':
+            literal = re.match(r'"(?:\\.|[^"\\])*"', text[index:], re.S)
+            end = index + (literal.end() if literal else 1)
+            out.append(text[index:end])
+            index = end
+        elif text[index] == "'":
+            literal = re.match(r"'(?:\\.[^']*|[^'\\])'", text[index:])
+            end = index + (literal.end() if literal else 1)
+            out.append(text[index:end])
+            index = end
+        else:
+            out.append(text[index])
+            index += 1
+    return "".join(out)
+
+
+def knuffel_child_names_in(text, struct, where="<text>"):
+    """The kebab-cased names of struct's `#[knuffel(child...)]` fields.
+
+    Reads Rust source text: knuffel names a child after its field, `_` as
+    `-`. Comments are dropped before the struct is found, so a commented `}`
+    cannot end its body early, and an attribute may be spaced or split over
+    lines, with comments inside, wherever Rust allows. Returns None when the
+    struct is not found as `pub struct Name {`.
+    """
+    found = re.search(
+        rf"^pub struct {struct} \{{[ \t]*\n(.*?)^\}}",
+        strip_rust_comments(text),
+        re.S | re.M,
+    )
+    if found is None:
+        return None
+    body = found.group(1)
+    attribute = r"#\s*\[\s*knuffel\s*\((.*?)\)\s*\]"
+    fields = re.finditer(
+        attribute + r"\s*"
+        r"(?:#\s*\[[^\]]*\]\s*)*"  # other attributes
+        r"(?:pub(?:\s*\([^)]*\))?\s+)?(?:r#)?(\w+)\s*:",  # the field
+        body,
+        re.S,
+    )
+    names = [
+        field.replace("_", "-")
+        for argument, field in (match.groups() for match in fields)
+        if re.match(r"\s*child\b", argument)
+    ]
+    # Every child attribute pairs with a field, or the pattern above missed one.
+    children = re.findall(r"#\s*\[\s*knuffel\s*\(\s*child\b", body)
+    if len(names) != len(children):
+        raise AssertionError(f"{where} {struct}: unpaired #[knuffel(child)] attribute")
+    return names
+
+
+def knuffel_child_names(path, struct):
+    """knuffel_child_names_in for path under swayward-config/src."""
+    return knuffel_child_names_in((CONFIG_SRC / path).read_text(), struct, path)
+
+
+def cfg_attr_knuffel_lines(text):
+    """The lines where a `cfg_attr(...)` holding `knuffel(` starts.
+
+    knuffel_child_names_in reads only plain `#[knuffel(...)]` attributes, so
+    a child field behind cfg_attr would escape the SINGULAR check. Comments
+    are dropped first; string literals inside the attribute are not parsed.
+    """
+    text = strip_rust_comments(text)
+    lines = []
+    for found in re.finditer(r"\bcfg_attr\s*\(", text):
+        depth, index = 1, found.end()
+        while index < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[index], 0)
+            index += 1
+        if re.search(r"\bknuffel\s*\(", text[found.end() : index]):
+            lines.append(text.count("\n", 0, found.start()) + 1)
+    return lines
+
+
+class SingularTests(unittest.TestCase):
+    """SINGULAR against the Rust config structs, read as text, without Cargo.
+
+    Scope: the parents listed in SINGULAR_STRUCTS and the top level. It does
+    not find which parents the translator emits; a new emitted parent needs
+    an entry here by hand.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.s2k = load_script()
+
+    def test_every_singular_parent_names_its_struct(self):
+        self.assertEqual(set(self.s2k.SINGULAR), {"", *SINGULAR_STRUCTS})
+
+    def test_singular_mirrors_knuffel_child_fields(self):
+        cfg_attr = [
+            f"{path.relative_to(ROOT)}:{line}"
+            for path in sorted(CONFIG_SRC.rglob("*.rs"))
+            for line in cfg_attr_knuffel_lines(path.read_text())
+        ]
+        self.assertEqual(
+            cfg_attr,
+            [],
+            "#[cfg_attr(..., knuffel(...))] is invisible to this check, so a "
+            "child field behind it would escape SINGULAR; write the knuffel "
+            "attribute unconditionally or teach knuffel_child_names_in to read it",
+        )
+        for parent, (path, struct) in SINGULAR_STRUCTS.items():
+            with self.subTest(parent=parent, struct=struct):
+                names = knuffel_child_names(path, struct)
+                self.assertIsNotNone(names, f"no `pub struct {struct} {{` in {path}")
+                self.assertTrue(names, f"{struct} has no #[knuffel(child)] field")
+                self.assertEqual(len(names), len(set(names)))
+                self.assertEqual(self.s2k.SINGULAR[parent], frozenset(names))
+
+    def test_knuffel_child_names_reads_a_multi_line_commented_attribute(self):
+        # The parse once required `child` right after the parenthesis, so
+        # this field was not seen and SINGULAR could drift past it.
+        source = (
+            "pub struct Synthetic {\n"
+            "    #[knuffel(\n"
+            "        // note\n"
+            "        child, unwrap(argument)\n"
+            "    )]\n"
+            "    pub noted: u8,\n"
+            "}\n"
+        )
+        self.assertEqual(knuffel_child_names_in(source, "Synthetic"), ["noted"])
+
+    def test_knuffel_child_names_reads_every_spelling_of_the_attribute(self):
+        # A synthetic struct: the guard must see a child field however its
+        # attribute is spelled, or a new singular field drifts silently.
+        source = (
+            "pub struct Synthetic {\n"
+            "    #[knuffel(child)]\n"
+            "    pub plain: bool,\n"
+            "    #[knuffel(\n"
+            "        // note\n"
+            "        child, unwrap(argument)\n"
+            "    )]\n"
+            "    pub multi_line: u8,\n"
+            "    # [ knuffel ( /* why */ child , default ) ]\n"
+            "    pub(crate) spaced: u8,\n"
+            "    #[knuffel(child, default = \"// not a comment\")]\n"
+            "    /// docs\n"
+            "    #[allow(dead_code)]\n"
+            "    pub r#after_attributes: u8,\n"
+            "    // #[knuffel(child)]\n"
+            "    /* #[knuffel(child)] */\n"
+            "    #[knuffel(children)]\n"
+            "    pub repeated: Vec<u8>,\n"
+            "    #[knuffel(argument)]\n"
+            "    pub child: u8,\n"
+            "}\n"
+        )
+        self.assertEqual(
+            knuffel_child_names_in(source, "Synthetic"),
+            ["plain", "multi-line", "spaced", "after-attributes"],
+        )
+
+    def test_knuffel_child_names_reads_past_a_commented_closing_brace(self):
+        # Comments were once stripped after the body was cut at the first
+        # line starting with `}`, so this commented brace hid `second`. Whole
+        # files are stripped now, so the raw string's `/*` must stay text.
+        source = (
+            'const BEFORE: &str = r#"say "/*" and //"#;\n'
+            "pub struct Synthetic {\n"
+            "    #[knuffel(child)]\n"
+            "    pub first: bool,\n"
+            "/*\n"
+            "}\n"
+            "*/\n"
+            "    #[knuffel(child)]\n"
+            "    pub second: bool,\n"
+            "}\n"
+        )
+        self.assertEqual(
+            knuffel_child_names_in(source, "Synthetic"), ["first", "second"]
+        )
+
+    def test_cfg_attr_knuffel_lines_finds_every_spelling(self):
+        source = (
+            "#[derive(knuffel::Decode)]\n"
+            "pub struct Synthetic {\n"
+            "    #[cfg_attr(test, knuffel(child))]\n"
+            "    pub one_line: bool,\n"
+            "    /* a\n"
+            "       b */\n"
+            "    # [ cfg_attr (\n"
+            "        all(test, feature = \"x\"),\n"
+            "        knuffel ( child )\n"
+            "    ) ]\n"
+            "    pub split: bool,\n"
+            "    // #[cfg_attr(test, knuffel(child))]\n"
+            "    /* #[cfg_attr(test, knuffel(child))] */\n"
+            "    #[cfg_attr(test, derive(Debug))]\n"
+            "    #[knuffel(child)]\n"
+            "    pub plain: bool,\n"
+            "}\n"
+        )
+        self.assertEqual(cfg_attr_knuffel_lines(source), [3, 7])
+
+    def test_knuffel_child_names_rejects_an_unpaired_child_attribute(self):
+        source = (
+            "pub struct Synthetic {\n"
+            "    #[knuffel(child)]\n"
+            "    #[knuffel(\n"
+            "        child,\n"
+            "    )]\n"
+            "    pub only_one_field: u8,\n"
+            "}\n"
+        )
+        with self.assertRaisesRegex(AssertionError, "unpaired"):
+            knuffel_child_names_in(source, "Synthetic")
+
+    def test_singular_top_level_mirrors_config_decode(self):
+        # decode.rs rejects a second node of any top-level name except the
+        # multipart sections listed in its `matches!(name, ...)`.
+        text = (CONFIG_SRC / "decode.rs").read_text()
+        multipart = re.search(r"if !matches!\(\s*name,(.*?)\)\s*&&", text, re.S)
+        self.assertIsNotNone(multipart, "decode.rs: no multipart matches!(name, ...)")
+        multipart = set(re.findall(r'"([a-z-]+)"', multipart.group(1)))
+        start = text.index("match name {", text.index("if !matches!("))
+        end = text.index("name => {", start)
+        arms = set(re.findall(r'^\s*"([a-z-]+)" =>', text[start:end], re.M))
+        self.assertTrue({"output", "window-rule", "include"} <= multipart <= arms)
+        self.assertEqual(self.s2k.SINGULAR[""], frozenset(arms - multipart))
 
 
 if __name__ == "__main__":
