@@ -248,8 +248,8 @@ and the failing and unreached assertions counted.
 | Files | 242 |
 | Fully green files | 94 |
 | Declared assertions | 3,171 |
-| Pass | 1,875 |
-| Documented skip | 891 |
+| Pass | 1,874 |
+| Documented skip | 892 |
 | Fail | 349 |
 | Unreached | 56 |
 <!-- end coverage-report -->
