@@ -4,61 +4,88 @@
 //! commands as plain strings, which the KDL decoder cannot check. They are
 //! parsed only when the key is pressed or the window maps, so a misspelt or
 //! unimplemented command would otherwise stay unnoticed until then.
-
 use std::fmt;
+
+use swayward_ipc::command::{parse_with_variables, FocusedNode};
 
 use crate::{Action, Binds, Config};
 
-/// A sway command string that the command parser rejects.
+/// Why a sway command string would be refused when run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwayCommandProblemKind {
+    Invalid,
+    Unimplemented,
+}
+
+/// A sway command string that would be refused when run.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InvalidSwayCommand {
+pub struct SwayCommandProblem {
     /// The config section holding the command, such as `binds` or `mode "resize"`.
     pub section: String,
     /// The command string as written.
     pub command: String,
+    pub kind: SwayCommandProblemKind,
     /// The reply the command would get when run.
     pub error: String,
 }
 
-impl fmt::Display for InvalidSwayCommand {
+impl fmt::Display for SwayCommandProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             section,
             command,
+            kind,
             error,
         } = self;
-        write!(f, "{section}: invalid sway command {command:?}: {error}")
+        match kind {
+            SwayCommandProblemKind::Invalid => {
+                write!(f, "{section}: invalid sway command {command:?}: {error}")
+            }
+            SwayCommandProblemKind::Unimplemented => write!(
+                f,
+                "{section}: sway command {command:?} is not implemented in swayward: {error}"
+            ),
+        }
     }
 }
 
-/// The reply to the first command in `command` that sway would refuse as
-/// invalid.
+/// The first command in `command` that would be refused as invalid.
 ///
 /// Only CMD_INVALID counts. A CMD_FAILURE depends on what is focused when the
 /// command runs, so it says nothing about the config. A command that uses a
 /// variable is skipped: its value is set at run time and may be what makes the
 /// arguments valid.
-fn invalid_reply(command: &str) -> Option<String> {
+fn refusal(command: &str) -> Option<(SwayCommandProblemKind, String)> {
     if command.contains('$') {
         return None;
     }
-    swayward_ipc::command::parse(command)
+    parse_with_variables(command, &[])
         .into_iter()
         .filter_map(Result::err)
-        .find(|outcome| outcome.parse_error == Some(true))
-        .map(|outcome| outcome.error.unwrap_or_default())
+        .find_map(|failure| {
+            let kind = if failure.is_unimplemented() {
+                SwayCommandProblemKind::Unimplemented
+            } else {
+                SwayCommandProblemKind::Invalid
+            };
+            // A bind's command runs with whatever is focused; a view is the
+            // case where sway's handlers get as far as their arguments.
+            let outcome = failure.resolve(FocusedNode::View);
+            (outcome.parse_error == Some(true)).then(|| (kind, outcome.error.unwrap_or_default()))
+        })
 }
 
 impl Config {
     /// Lists the sway command strings in binds, binding modes and window rules
-    /// that would be refused as invalid when run, in config order.
-    pub fn invalid_sway_commands(&self) -> Vec<InvalidSwayCommand> {
-        let mut invalid = Vec::new();
+    /// that would be refused when run, in config order.
+    pub fn sway_command_problems(&self) -> Vec<SwayCommandProblem> {
+        let mut problems = Vec::new();
         let mut check = |section: &str, command: &str| {
-            if let Some(error) = invalid_reply(command) {
-                invalid.push(InvalidSwayCommand {
+            if let Some((kind, error)) = refusal(command) {
+                problems.push(SwayCommandProblem {
                     section: section.to_owned(),
                     command: command.to_owned(),
+                    kind,
                     error,
                 });
             }
@@ -79,7 +106,7 @@ impl Config {
                 check("window-rule", command);
             }
         }
-        invalid
+        problems
     }
 }
 
@@ -87,12 +114,17 @@ impl Config {
 mod tests {
     use super::*;
 
+    fn problems(config: &str) -> Vec<SwayCommandProblem> {
+        Config::parse_mem(config).unwrap().sway_command_problems()
+    }
+
     fn invalid(config: &str) -> Vec<(String, String, String)> {
-        Config::parse_mem(config)
-            .unwrap()
-            .invalid_sway_commands()
+        problems(config)
             .into_iter()
-            .map(|found| (found.section, found.command, found.error))
+            .map(|found| {
+                assert_eq!(found.kind, SwayCommandProblemKind::Invalid, "{found}");
+                (found.section, found.command, found.error)
+            })
             .collect()
     }
 
@@ -172,16 +204,68 @@ mod tests {
         );
     }
 
+    /// A command sway accepts is reported as swayward's gap, not as a mistake
+    /// in the config.
+    #[test]
+    fn commands_sway_accepts_are_reported_as_unimplemented() {
+        let found = problems(
+            r#"
+            binds {
+                Mod+A { command "seat seat0 hide_cursor 1000"; }
+                Mod+B { command "focus left; input type:touchpad tap enabled"; }
+                Mod+C { command "seat"; }
+            }
+            window-rule {
+                match app-id="^mpv$"
+                sway-for-window-command "urgent allow"
+            }
+            "#,
+        );
+        let places = found
+            .iter()
+            .map(|found| (found.section.as_str(), found.command.as_str(), found.kind))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            places,
+            [
+                (
+                    "binds",
+                    "seat seat0 hide_cursor 1000",
+                    SwayCommandProblemKind::Unimplemented
+                ),
+                (
+                    "binds",
+                    "focus left; input type:touchpad tap enabled",
+                    SwayCommandProblemKind::Unimplemented
+                ),
+                ("binds", "seat", SwayCommandProblemKind::Unimplemented),
+                (
+                    "window-rule",
+                    "urgent allow",
+                    SwayCommandProblemKind::Unimplemented
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn display_names_the_section_command_and_reply() {
-        let found = InvalidSwayCommand {
+        let mut found = SwayCommandProblem {
             section: "binds".into(),
             command: "kil".into(),
+            kind: SwayCommandProblemKind::Invalid,
             error: "Unknown/invalid command 'kil'".into(),
         };
         assert_eq!(
             found.to_string(),
             r#"binds: invalid sway command "kil": Unknown/invalid command 'kil'"#
+        );
+        found.command = "seat seat0 hide_cursor 1000".into();
+        found.kind = SwayCommandProblemKind::Unimplemented;
+        found.error = "Unknown/invalid command 'seat'".into();
+        assert_eq!(
+            found.to_string(),
+            r#"binds: sway command "seat seat0 hide_cursor 1000" is not implemented in swayward: Unknown/invalid command 'seat'"#
         );
     }
 }
