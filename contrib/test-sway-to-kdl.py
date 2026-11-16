@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
+import difflib
+import functools
 import json
 import os
+import pickle
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,15 +13,134 @@ from pathlib import Path
 ROOT = Path(__file__).parents[1]
 SCRIPT = Path(__file__).with_name("sway-to-kdl")
 
+# Every translator run is compared with a committed golden: the input, stdout
+# and stderr between marker lines. SWAY_TO_KDL_UPDATE_GOLDENS=1 rewrites them;
+# a missing golden fails. SWAY_TO_KDL_TRACE=<dir> runs the translator under
+# `python3 -m trace` and accumulates line counts in <dir>.
+GOLDENS = Path(__file__).with_name("sway-to-kdl-goldens")
+UPDATE_GOLDENS = os.environ.get("SWAY_TO_KDL_UPDATE_GOLDENS") == "1"
+TRACE = os.environ.get("SWAY_TO_KDL_TRACE")
+
+
+def prefix_spellings(path, placeholder):
+    path = Path(path)
+    return [(os.path.abspath(path), placeholder), (str(path.resolve()), placeholder)]
+
+
+def normalise(text, prefixes):
+    # Longest first, so a resolved spelling that extends a given one wins.
+    for prefix, placeholder in sorted(prefixes, key=lambda p: -len(p[0])):
+        text = text.replace(prefix, placeholder)
+    return text
+
+
+def golden_section(name, content):
+    section = f"==== sway-to-kdl golden: {name} ====\n{content}"
+    if content and not content.endswith("\n"):
+        section += "\n==== no newline at end of section ====\n"
+    return section
+
 
 class TranslatorTests(unittest.TestCase):
+    def setUp(self):
+        self.golden_calls = 0
+
     def translate(self, source: str):
         with tempfile.TemporaryDirectory() as directory:
             source_path = Path(directory) / "config"
             source_path.write_text(source)
-            return subprocess.run(
-                [SCRIPT, source_path], text=True, capture_output=True, check=True
+            return self.run_translator(source_path, tmp=directory)
+
+    def run_translator(self, path, env=None, tmp=None):
+        """Run the translator on path and compare it with its golden.
+
+        tmp is the test's temporary directory: it is normalised to <tmp>, and
+        every file under it before the run is recorded as input. (Read them
+        first: Apple's Python writes bytecode under $HOME, which some tests
+        point into tmp.)
+        """
+        inputs = [Path(path)]
+        if tmp is not None:
+            inputs += sorted(
+                p for p in Path(tmp).rglob("*") if p.is_file() and p != Path(path)
             )
+        command = [SCRIPT, path]
+        if TRACE:
+            trace_dir = Path(TRACE).resolve()
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            counts = trace_dir / "counts"
+            if not counts.exists():
+                # trace reports a missing counts file on stderr; start empty.
+                counts.write_bytes(pickle.dumps(({}, {}, {}), 1))
+            command = [
+                sys.executable, "-m", "trace", "--count", "--missing",
+                "--coverdir", trace_dir, "--file", counts,
+                *command,
+            ]
+        result = subprocess.run(
+            command, text=True, capture_output=True, check=True, env=env
+        )
+        self.golden_calls += 1
+        golden = GOLDENS / f"{self._testMethodName}.{self.golden_calls}.golden"
+        prefixes = prefix_spellings(ROOT, "<repo>")
+        if tmp is not None:
+            prefixes += prefix_spellings(tmp, "<tmp>")
+        sections = [
+            golden_section(f"input {input_path}", input_path.read_text())
+            for input_path in inputs
+        ]
+        sections.append(golden_section("stdout", result.stdout))
+        sections.append(golden_section("stderr", result.stderr))
+        actual = normalise("".join(sections), prefixes)
+        home = os.path.expanduser("~")
+        if home in actual:
+            self.fail(f"{golden.name}: normalised output still contains {home}")
+        if UPDATE_GOLDENS:
+            GOLDENS.mkdir(exist_ok=True)
+            if not golden.exists() or golden.read_text() != actual:
+                golden.write_text(actual)
+        elif not golden.exists():
+            self.fail(
+                f"missing golden contrib/{GOLDENS.name}/{golden.name}; "
+                "rerun with SWAY_TO_KDL_UPDATE_GOLDENS=1 and commit it"
+            )
+        else:
+            expected = golden.read_text()
+            if expected != actual:
+                diff = "".join(
+                    difflib.unified_diff(
+                        expected.splitlines(True),
+                        actual.splitlines(True),
+                        str(golden.name),
+                        "actual",
+                    )
+                )
+                self.fail(f"translator output differs from {golden.name}:\n{diff}")
+        return result
+
+    def check_no_stale_goldens(self):
+        """Fail on, or under UPDATE_GOLDENS delete, goldens past the last call."""
+        stale = []
+        for golden in GOLDENS.glob(f"{self._testMethodName}.*.golden"):
+            n = golden.name.split(".")[1]
+            if n.isdigit() and int(n) > self.golden_calls:
+                stale.append(golden)
+        if UPDATE_GOLDENS:
+            for golden in stale:
+                golden.unlink()
+        elif stale:
+            names = ", ".join(sorted(g.name for g in stale))
+            self.fail(
+                f"stale goldens beyond call {self.golden_calls}: {names}; "
+                "rerun with SWAY_TO_KDL_UPDATE_GOLDENS=1 to delete them"
+            )
+
+    def test_every_golden_belongs_to_a_test(self):
+        tests = {name for name in dir(self) if name.startswith("test_")}
+        for golden in sorted(GOLDENS.glob("*")):
+            with self.subTest(golden=golden.name):
+                self.assertRegex(golden.name, r"^test_\w+\.\d+\.golden$")
+                self.assertIn(golden.name.split(".")[0], tests)
 
     def test_translates_supported_directives_and_reports_the_rest(self):
         result = self.translate(
@@ -1496,9 +1619,7 @@ bindsym Mod5+q workspace 1
             (fixtures / "swayfx-default.conf", 7),
         ]:
             with self.subTest(source=source.name):
-                result = subprocess.run(
-                    [SCRIPT, source], text=True, capture_output=True, check=True
-                )
+                result = self.run_translator(source)
                 self.assertIn(
                     f"manual attention: {expected} directive(s)", result.stderr
                 )
@@ -1526,12 +1647,8 @@ bindsym Mod5+q workspace 1
                 "set $file variable\n"
                 "include $file\n"
             )
-            result = subprocess.run(
-                [SCRIPT, root / "config"],
-                text=True,
-                capture_output=True,
-                check=True,
-                env={**os.environ, "HOME": str(home)},
+            result = self.run_translator(
+                root / "config", env={**os.environ, "HOME": str(home)}, tmp=root
             )
         for command in ["absolute", "relative", "tilde", "glob", "variable"]:
             with self.subTest(command=command):
@@ -1543,9 +1660,7 @@ bindsym Mod5+q workspace 1
             root = Path(directory)
             (root / "child").write_text("bindsym Mod4+h focus left\ninclude config\n")
             (root / "config").write_text("include child\ninclude ./child\n")
-            result = subprocess.run(
-                [SCRIPT, root / "config"], text=True, capture_output=True, check=True
-            )
+            result = self.run_translator(root / "config", tmp=root)
         self.assertEqual(result.stdout.count('Super+h { command "focus left"; }'), 1)
         self.assertNotIn("include cycle", result.stdout)
         self.assertIn("manual attention: none", result.stderr)
@@ -1558,12 +1673,138 @@ bindsym Mod5+q workspace 1
                 (root / "config").write_text(
                     f"include {command.format(marker=marker)}\n"
                 )
-                result = subprocess.run(
-                    [SCRIPT, root / "config"], text=True, capture_output=True, check=True
-                )
+                result = self.run_translator(root / "config", tmp=root)
                 self.assertFalse(marker.exists())
                 self.assertIn("command substitution is refused", result.stdout)
                 self.assertIn("manual attention: 1 directive(s)", result.stderr)
+
+    # Golden-only inputs: synthetic snippets that reach translator branches no
+    # behavioural test above exercises (found with SWAY_TO_KDL_TRACE). They
+    # assert nothing beyond the golden, which freezes today's output.
+
+    def test_golden_only_top_level_directives(self):
+        self.translate(
+            "bindsym Mod4+x exec echo \\$HOME\n"
+            "workspace 1 output DP-1 HDMI-A-1\n"
+            'workspace "2" output "DP-2"\n'
+            "floating_minimum_size 100 x 50\n"
+            "floating_maximum_size -2 x 10\n"
+            "smart_borders no_gaps\n"
+            "smart_gaps bogus\n"
+            "force_focus_wrapping yes\n"
+            "force_focus_wrapping no\n"
+            "focus_on_window_activation bogus\n"
+            "default_border none 2\n"
+            "exec --no-startup-id\n"
+        )
+        self.translate("floating_modifier \\\n\n")
+        self.translate("include .\n")
+
+    def test_golden_only_grouped_blocks_skip_comments_and_report_bad_entries(self):
+        self.translate(
+            "set {\n    # comment\n\n    $a b\n    garbage\n}\n"
+            "bindsym {\n    # comment\n    Mod4+a nop a\n}\n"
+            "exec {\n    # comment\n    mako\n}\n"
+            "for_window {\n    # comment\n    floating enable\n}\n"
+        )
+
+    def test_golden_only_mode_body_variables_and_unknown_directives(self):
+        self.translate(
+            'mode "m" {\n'
+            "    set {\n        $x Return\n    }\n"
+            "    set $y Escape\n"
+            "    bindsym $x nop x\n"
+            "    bindsym $y nop y\n"
+            "    gaps inner 4\n"
+            "}\n"
+        )
+
+    def test_golden_only_bind_option_edge_cases(self):
+        self.translate(
+            "bindsym --locked\n"
+            "bindsym Mod4+a --whole-window\n"
+            "bindsym Mod4+b --foo exec x\n"
+        )
+
+    def test_golden_only_client_colors(self):
+        self.translate(
+            "client.focused #ffffff #000000\n"
+            "client.unfocused #111111 #222222 #333333\n"
+            "client.focused_tab_title #444444 #555555 #666666\n"
+        )
+
+    def test_golden_only_criteria_edge_cases(self):
+        self.translate(
+            'assign [class="x"] 1\n'
+            "for_window [ ] kill\n"
+            'for_window [con_mark="x"] kill\n'
+        )
+
+    def test_golden_only_for_window_effects(self):
+        self.translate(
+            'for_window [app_id="a"] floating enable, floating disable\n'
+            'for_window [app_id="b"] layout tabbed\n'
+            'for_window [app_id="c"] opacity 0.5, opacity set 0.25\n'
+            'for_window [app_id="d"] opacity abc\n'
+            'for_window [app_id="e"] opacity 2\n'
+            'for_window [app_id="f"] move workspace 3\n'
+            'for_window [app_id="g"] resize set a ppt b ppt\n'
+            'for_window [app_id="h"] resize set 0 ppt 0 ppt\n'
+            'for_window [app_id="i"] resize set 10 abc\n'
+            'for_window [app_id="j"] opacity 0.5, dim_inactive 0.2\n'
+            'for_window [app_id="k"] corner_radius 5, blur enable, shadows on\n'
+            'for_window [app_id="l"] blur off, shadows off\n'
+        )
+
+    def test_golden_only_input_block_edge_cases(self):
+        self.translate(
+            "input * {\n    xkb_layout us\n    repeat_rate 30\n}\n"
+            "input type:keyboard {\n\n    xkb_numlock\n}\n"
+            "input type:touchpad {\n    mystery on\n    pointer_accel fast\n"
+            "    scroll_button BTN_FOO\n}\n"
+        )
+
+    def test_golden_only_output_block_edge_cases(self):
+        self.translate(
+            "output DP-1 {\n    enable\n    transform 45\n    position 10\n}\n"
+            "output DP-2 position a,b\n"
+            "output DP-3 disable\n"
+            "output DP-4 foo bar scale 2\n"
+        )
+
+    def test_golden_only_swayfx_titlebar_border_thickness(self):
+        self.translate("titlebar_border_thickness 2\ntitlebar_padding 4 4\n")
+        self.translate(
+            "titlebar_border_thickness x\n"
+            "titlebar_border_thickness 99\n"
+        )
+
+    def test_golden_only_layer_effects_edge_cases(self):
+        self.translate(
+            "layer_effects waybar\n"
+            'layer_effects "rofi" blur_xray enable; shadows on; corner_radius 4; foo bar\n'
+        )
+
+
+def checking_stale_goldens(method):
+    # Runs inside the test body, so a stale golden fails that test. The check
+    # is skipped when the body raised (failure, error, skip) or a subTest
+    # failed: its call count is then incomplete. A failed subTest does not
+    # raise; it leaves _outcome.success false, on Python 3.9 through 3.15.
+    @functools.wraps(method)
+    def wrapper(self):
+        method(self)
+        outcome = getattr(self, "_outcome", None)
+        if outcome is None or outcome.success:
+            self.check_no_stale_goldens()
+
+    return wrapper
+
+
+for _name in [n for n in vars(TranslatorTests) if n.startswith("test_")]:
+    setattr(
+        TranslatorTests, _name, checking_stale_goldens(getattr(TranslatorTests, _name))
+    )
 
 
 if __name__ == "__main__":
