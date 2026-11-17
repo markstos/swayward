@@ -6,96 +6,13 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
+import os
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterator, Union
-
-
-# ---------------------------------------------------------------------------
-# Legacy helpers (C2 only)
-#
-# The pipeline follows sway. Wherever following it would change today's
-# output, which the goldens record, the code goes through one of these
-# instead; each is defined in the section named. C3 deletes each one with
-# the fix it stands for and updates the goldens that fix changes.
-#
-# Reader
-# - LegacyReader: today's segmentation. A continuation is joined as
-#   `text[:-1] + " " + next.strip()` and never inside a block body. A block
-#   opens where a block handler's pattern matches, and its extent is a raw
-#   count of `{` and `}` on physical lines, quoted or commented ones
-#   included, so `X { a }` on one line is a block and a `{` on the next
-#   line opens none. translate_mode re-reads its body with scan_block.
-#   C3: read_config, which reports one-line blocks and handles a
-#   continuation or a next-line `{` inside a block.
-#
-# Handlers
-# - legacy_handler_key: routes by today's regex prefixes and re.IGNORECASE
-#   folding. C3: sway's case-insensitive argv[0] lookup.
-# - LEGACY_MODIFIER_ALIASES: one table of modifiers and XKB group names, so
-#   `Mode_switch+a` and `Group2+a` pass as modifiers and `Mod3` is refused.
-#   C3: separate SWAY_MODIFIERS and SWAY_GROUPS (sway/input/keyboard.c:24-50,
-#   sway/commands/bind.c:398-449).
-# - legacy_unquote: strips quote characters from both ends of a selector or
-#   name that a handler regex cut from the text, so `output "A B" scale 2`
-#   names output `A`. C3: strip_quotes over the lexed arguments.
-# - legacy_command_list: for_window splits its command list on every `,`
-#   and `;`, quoted or bracketed ones included (`title_format "a, b"`).
-#   C3: split_command_list, which cuts with argsep.
-# - legacy_layer_effects: layer_effects strips braces from both ends of its
-#   effects and splits them on every `;`. C3: split_command_list.
-# - legacy_bar_echo: the bar report echoes LegacyReader's block list, the
-#   expanded header and stripped body lines, joined with " | ". C3: the
-#   block's physical lines as read_config keeps them (Block.raw).
-# - legacy_mode_nested_line: a block nested inside a mode numbers its body
-#   from the line above its header, one line early. C3: from the header.
-# - legacy_unlocated_report: input-block and layer_effects comments omit
-#   the location that their manual-list item still gives. C3: every
-#   comment is located.
-# - legacy_keep_first: a duplicate binding keeps the first and reports the
-#   rest; sway lets the later one overwrite (sway/commands/bind.c:280-300).
-#   C3: none planned; it stays until the pipeline note's open question 3
-#   is decided.
-# - legacy_bind_trailing_options: --release, --whole-window, --border and
-#   --exclude-titlebar between a binding's key and its command become
-#   binding properties; sway reads options only before the key
-#   (sway/commands/bind.c:353-383), so they stay in its command.
-#   C3: leave them in the command.
-# - legacy_exec_unquote: an exec command, from exec, exec_always or a bind,
-#   loses one matching pair of outer quotes, so `exec "echo a" "echo b"`
-#   runs `echo a" "echo b`. C3: sway's rule, strip_quotes only when the
-#   command is one argument that starts with a quote, else join_args
-#   (sway/commands/exec_always.c:39-44).
-# - legacy_unescape_at: a bind command has every `\@` replaced by `@`;
-#   sway's lexed arguments keep `\@`, which unescape_string does not know
-#   (common/stringop.c:152-233). C3: keep `\@`.
-# - legacy_command_spelling: a bind command is respelled: `move container
-#   to workspace` as `move to workspace`, `splith` and `splitv` as
-#   `split h` and `split v`, `resize grow|shrink width|height <n>px` with
-#   a separate `px`. swayward parses sway's spellings
-#   (swayward-ipc/src/command/parse/mod.rs:366-367, move_resize.rs:85-90,
-#   :440). C3: pass the command through unchanged.
-#
-# KDL IR
-# - legacy_add: appends a singular child (SINGULAR) without dropping an
-#   earlier one, so a repeated directive emits a duplicate node that
-#   `swayward validate` rejects. C3: last wins through Node.set or
-#   Node.put, and Node.add raises on a SINGULAR name.
-# - legacy_g_float: formats with `:g`, so a whole number loses its ".0"
-#   (`accel-speed 1`, `proportion 1`). C3: pass the float, which render()
-#   writes with kdl_float.
-# - legacy_workspace_assignment: workspaces with an output assignment
-#   render before the rest, in first-assignment order. C3: first-mention
-#   order.
-#
-# Not a helper: the handlers parse Directive.text with the moved regexes
-# and str.split, never Directive.args, so no argument is unescaped
-# (`bindsym Mod4+a exec echo \"x\"` keeps both backslashes in `command`).
-# C3 moves them to Directive.args. Frontend.expand and its `\$` to `$`
-# replacement also move verbatim (the pipeline note, "Risks").
-# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -406,16 +323,14 @@ def split_command_list(s: str) -> list[Command]:
 # read_config segments a file into logical lines and blocks by sway 1.12's
 # rules (sway/config.c:666-869). It expands no variables and runs no
 # includes: sway runs both as directives, in source order, so the front end
-# does. Nothing calls read_config yet: the front end reads with
-# LegacyReader, today's segmentation, which the goldens record; C3 switches
-# it over.
+# does.
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Pos:
     path: Path
-    line: int  # first physical line; 0 = whole file (as warn() reports it)
+    line: int  # first physical line; 0 = the whole file
 
 
 @dataclass(frozen=True)
@@ -431,6 +346,10 @@ class Block:
     body: list[Line | Block]
     raw: tuple[str, ...]  # header through closing line
     end: Line | None = None  # the closing line; None if the file ended first
+
+
+# The block read_config hands to config_commands_command (sway/config.c:805-807).
+COMMANDS_BLOCK = "<commands>"
 
 
 def _physical_lines(data: str) -> list[str]:
@@ -460,13 +379,16 @@ def read_config(path: Path) -> list[Line | Block]:
       comment stops the search. The " {" joins the line before it is split,
       so `x "abc` swallows the `{` into its open quote and opens nothing.
     - A last token of `}` closes the innermost block
-      (sway/commands.c:362-366), whatever precedes it: `X { a }` closes the enclosing block,
-      and at top level it is an unmatched `}` (config.c:842-846) that this
-      returns as a Line. A block still open at the end of the file ends
-      there with no `end`, as sway's stack is dropped silently.
-
-    The `<commands>` dispatch at config.c:805-807 is unreachable in sway 1.12:
-    no handler returns CMD_BLOCK_COMMANDS, so it is not modelled.
+      (sway/commands.c:362-366), whatever precedes it: `X { a }` closes the
+      enclosing block, and at top level it is an unmatched `}`
+      (config.c:842-846) that this returns as a Line. A block still open at
+      the end of the file ends there with no `end`, as sway's stack is
+      dropped silently.
+    - A top-level block named exactly `<commands>` sends every later line to
+      config_commands_command (config.c:805-807). That never returns
+      CMD_BLOCK, nor CMD_BLOCK_END, since each line's first token is the
+      prefix `<commands>` (sway/commands.c:452-481): the block takes the rest
+      of the file as its body, as Lines, and has no end.
 
     Bytes are decoded as UTF-8 with surrogateescape and only "\n" ends a line,
     as with getline. A header's text drops the `{` token and the whitespace
@@ -479,6 +401,7 @@ def read_config(path: Path) -> list[Line | Block]:
     raw = [line[:-1] if line.endswith("\n") else line for line in physical]
     top: list[Line | Block] = []
     stack: list[tuple[Block, int]] = []  # open blocks, with their first index
+    commands: Block | None = None
     index = 0
     while index < len(physical):
         start = index
@@ -505,6 +428,9 @@ def read_config(path: Path) -> list[Line | Block]:
                         index = probe
                     break
         line = Line(text, tuple(raw[start:index]), Pos(path, start + 1))
+        if commands is not None:
+            commands.body.append(line)
+            continue
         parent = stack[-1][0].body if stack else top
         tokens = split_args(text)
         if tokens and tokens[-1] == "{" and (len(tokens) > 1 or stack):
@@ -514,6 +440,8 @@ def read_config(path: Path) -> list[Line | Block]:
             block = Block(Line(name, line.raw, line.pos), [], ())
             parent.append(block)
             stack.append((block, start))
+            if len(stack) == 1 and tokens[:-1] == [COMMANDS_BLOCK]:
+                commands = block
         elif tokens and tokens[-1] == "}" and stack:
             block, first = stack.pop()
             block.end = line
@@ -525,10 +453,37 @@ def read_config(path: Path) -> list[Line | Block]:
     return top
 
 
+# A byte read_config could not decode as UTF-8 (surrogateescape).
+UNDECODABLE = re.compile("[\udc80-\udcff]")
+
+
+def printable(text: str) -> str:
+    """text with each undecodable byte written as a `\\xNN` escape."""
+    return text.encode("utf-8", "surrogateescape").decode("utf-8", "backslashreplace")
+
+
+def block_depth(block: Block) -> int:
+    """How deeply blocks nest in block, itself included."""
+    depth, level = 0, [block]
+    while level:
+        depth += 1
+        level = [child for b in level for child in b.body if isinstance(child, Block)]
+    return depth
+
+
 def expand_line(block: str | None, line: str, add_brace: bool) -> str:
     """Sway's `expand_line` (sway/config.c:719-729)."""
     prefix = f"{block} " if block is not None else ""
     return prefix + line + (" {" if add_brace else "")
+
+
+def block_name(text: str) -> str | None:
+    """The block a line opens, as config_command names it: join_args over its
+    split_args tokens without the last `{` (sway/commands.c:355-358)."""
+    tokens = split_args(text)
+    if tokens[-1:] == ["{"]:
+        tokens = tokens[:-1]
+    return join_args(tokens) if tokens else None
 
 
 def flatten(
@@ -538,9 +493,9 @@ def flatten(
 
     Yields (line, expanded) for every node in read order: a block's header
     (with " {"), its body, and its closing line. Inside a block the prefix is
-    the block name, join_args over the header's tokens, and it accumulates:
-    `bar {` + `colors {` + `a` runs `bar colors a`. Tokens match sway's;
-    whitespace inside an explicit header line is collapsed.
+    the block name, and it accumulates: `bar {` + `colors {` + `a` runs
+    `bar colors a`. Tokens match sway's; whitespace inside an explicit
+    header line is collapsed.
     """
     for node in nodes:
         if isinstance(node, Line):
@@ -553,94 +508,32 @@ def flatten(
             yield node.end, expand_line(name, node.end.text, False)
 
 
-class LegacyReader:
-    """Today's segmentation, which the goldens record; C2 only.
+def body_lines(nodes: list[Line | Block], prefix: str | None = None) -> list[Line]:
+    """A block body as the lines sway runs, without the block's own prefix.
 
-    next_line is the loop that opened Translator.parse and scan_block its
-    block() helper, both moved verbatim behind a cursor over the file's
-    physical lines. A continuation is joined as `text[:-1] + " " +
-    next.strip()`, and never inside a block body. A block's extent is a raw
-    count of `{` and `}` on physical lines, quoted or commented ones
-    included. take_block builds a Block whose raw is today's block list: the
-    expanded header first, then stripped physical lines, blanks and comments
-    kept. As today, the last line taken counts as the closing line even when
-    the file ended first. translate_mode re-reads its body with scan_block.
+    A nested block contributes its body lines, prefixed with its name
+    (sway/config.c:719-729); its header and closing line run nothing.
     """
-
-    def __init__(self, path: Path, lines: list[str]) -> None:
-        self.path = path
-        self.lines = lines
-        self.index = 0
-        self.last: Line | None = None
-
-    @classmethod
-    def open(cls, path: Path) -> LegacyReader:
-        return cls(path, path.read_text().splitlines())
-
-    def next_line(self) -> Line | None:
-        lines = self.lines
-        index = self.index
-        self.last = None
-        while index < len(lines):
-            line_no = index + 1
-            text = lines[index].strip()
-            index += 1
-            if not text or text.startswith("#"):
-                continue
-            while text.endswith("\\") and index < len(lines):
-                text = text[:-1] + " " + lines[index].strip()
-                index += 1
-            self.last = Line(
-                text, tuple(lines[line_no - 1 : index]), Pos(self.path, line_no)
-            )
-            break
-        self.index = index
-        return self.last
-
-    def take_block(self, first: str) -> Block:
-        """The block opened by the line next_line just returned.
-
-        `first` is that line as the caller matched it, variables expanded.
-        """
-        assert self.last is not None, "take_block follows next_line"
-        start = self.index
-        block, self.index = self.scan_block(self.lines, start, first)
-        lines = [
-            Line(text, (self.lines[index],), Pos(self.path, index + 1))
-            for index, text in enumerate(block[1:], start)
-        ]
-        header = first[:-1].rstrip() if first.endswith("{") else first
-        return Block(
-            Line(header, self.last.raw, self.last.pos),
-            list(lines[:-1]),
-            tuple(block),
-            lines[-1] if lines else None,
-        )
-
-    def take_body(self, first: str) -> list[str]:
-        """The text of take_block's body lines, as the block handlers read them."""
-        return [line.text for line in self.take_block(first).body]
-
-    @staticmethod
-    def scan_block(lines: list[str], index: int, first: str) -> tuple[list[str], int]:
-        block = [first]
-        depth = first.count("{") - first.count("}")
-        while depth > 0 and index < len(lines):
-            line = lines[index]
-            block.append(line.strip())
-            depth += line.count("{") - line.count("}")
-            index += 1
-        return block, index
+    lines: list[Line] = []
+    for node in nodes:
+        if isinstance(node, Line):
+            if prefix is not None:
+                node = Line(expand_line(prefix, node.text, False), node.raw, node.pos)
+            lines.append(node)
+        else:
+            name = block_name(expand_line(prefix, node.header.text, False))
+            lines += body_lines(node.body, name)
+    return lines
 
 
 # ---------------------------------------------------------------------------
 # Front end
 #
 # Variables, includes and the set of files already read, handled in source
-# order as sway does. run() reads each file with LegacyReader, handles set
-# and include itself, and yields a Directive for every other logical line,
-# expanded, with the reader, so a block handler can take the block the line
-# opens.
+# order as sway does. run() reads each file with read_config, handles set
+# itself, and yields a Directive for every other line and for every block,
+# expanded. Translator.parse runs an include directive's files through
+# include_files.
 # ---------------------------------------------------------------------------
 
 # config_command keeps quotes in these handlers' arguments
@@ -659,6 +552,50 @@ QUOTED_ARGUMENT_COMMANDS = frozenset(
     }
 )
 
+_ASCII_LOWER = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"
+)
+
+
+def ascii_lower(s: str) -> str:
+    """Lower case as strcasecmp compares in the C locale: ASCII letters only."""
+    return s.translate(_ASCII_LOWER)
+
+
+def sway_split(text: str, maxsplit: int = 0) -> list[str]:
+    """text split at runs of sway's whitespace (common/stringop.c:13), as
+    str.split(None, maxsplit) splits at Unicode whitespace."""
+    text = text.strip(SWAY_WHITESPACE)
+    return re.split(f"[{SWAY_WHITESPACE}]+", text, maxsplit=maxsplit) if text else []
+
+
+def unquote_args(args: list[str], strip: bool = True) -> list[str]:
+    """config_command's per-argument step (sway/commands.c:409-423): quotes
+    stripped from an argument that starts with one, unless strip is False,
+    then unescaped."""
+    return [
+        unescape_string(strip_quotes(arg) if strip and arg[:1] in "\"'" else arg)
+        for arg in args
+    ]
+
+
+def command_words(command: Command) -> list[str]:
+    """A listed command's argv as its handler sees it: quotes stripped from
+    every argument that starts with one, except under exec, exec_always and
+    mode (sway/commands.c:264-272)."""
+    argv = command.argv
+    if argv[0] in {"exec", "exec_always", "mode"}:
+        return list(argv)
+    return [argv[0], *(strip_quotes(a) if a[:1] in "\"'" else a for a in argv[1:])]
+
+
+def text_after(text: str, argv: list[str], count: int) -> str:
+    """text after its first count split_args tokens (argv), stripped."""
+    index = 0
+    for token in argv[:count]:
+        index = text.index(token, index) + len(token)
+    return text[index:].strip(SWAY_WHITESPACE)
+
 
 @dataclass
 class Directive:
@@ -667,23 +604,86 @@ class Directive:
     # config_command's view of argv[1:]: unescaped, with quotes stripped
     # except under QUOTED_ARGUMENT_COMMANDS; set's variable name is left alone.
     args: list[str]
-    text: str  # expanded logical text: today's string, used in messages
+    text: str  # expanded logical text, used in messages
     pos: Pos
+    block: Block | None = None  # the block this line opens; text ends in " {"
 
     @classmethod
-    def from_line(cls, text: str, pos: Pos) -> Directive:
+    def from_line(cls, text: str, pos: Pos, block: Block | None = None) -> Directive:
         argv = split_args(text)
         name = argv[0] if argv else ""
-        command = name.lower()  # find_core_handler ignores case
+        command = ascii_lower(name)  # find_core_handler ignores case
         first = 2 if command == "set" else 1
-        args = argv[1:first]
-        for arg in argv[first:]:
-            if command not in QUOTED_ARGUMENT_COMMANDS and arg.startswith(
-                ('"', "'")
-            ):
-                arg = strip_quotes(arg)
-            args.append(unescape_string(arg))
-        return cls(name, argv, args, text, pos)
+        args = argv[1:first] + unquote_args(
+            argv[first:], command not in QUOTED_ARGUMENT_COMMANDS
+        )
+        return cls(name, argv, args, text, pos, block)
+
+    def lowered(self) -> Directive:
+        """This directive with its name in lower case, as the handler tables
+        and patterns spell it: sway looks handlers up with strcasecmp
+        (sway/commands.c:145-149)."""
+        name = ascii_lower(self.name)
+        if name == self.name:
+            return self
+        return replace(
+            self,
+            name=name,
+            argv=[name, *self.argv[1:]],
+            text=name + self.text[len(self.name) :],
+        )
+
+
+SET_DIRECTIVE = re.compile(r"(?i:set)\s+(\$+[^\s]+)\s+(.+)")
+
+UNMATCHED_BLOCK_END = (
+    "sway rejects a line whose last token is `}` outside a block; a block "
+    "opened and closed on one line is unsupported (sway/sway/config.c:842-846)"
+)
+INNER_BLOCK_END = (
+    "sway ends the block at a line whose last token is `}` and runs nothing on "
+    "it; a block opened and closed on one line is unsupported "
+    "(sway/sway/commands.c:362-366)"
+)
+COMMANDS_BLOCK_REFUSED = (
+    "sway reads the rest of the file as the body of a <commands> block and "
+    "rejects every line of it (sway/sway/config.c:805-807, "
+    "sway/sway/commands.c:452-481)"
+)
+
+
+# Sway nests blocks to any depth (sway/config.c:732-869). decodable,
+# body_lines and report_block_ends recurse once per level, so a block nested
+# deeper than this is reported whole rather than reaching Python's recursion
+# limit.
+MAX_BLOCK_DEPTH = 64
+DEEP_BLOCK_REFUSED = (
+    f"blocks nested more than {MAX_BLOCK_DEPTH} deep are not translated; "
+    "sway reads any depth (sway/sway/config.c:732-869)"
+)
+UNDECODABLE_REFUSED = (
+    "the line is not valid UTF-8, and swayward reads its config as UTF-8 text "
+    "(swayward-config/src/decode.rs:397,455)"
+)
+
+
+def decodable(node: Line | Block, doc: Translator) -> Line | Block | None:
+    """node without the lines that are not UTF-8, each reported.
+
+    A block whose header is not UTF-8 is reported whole: every line in it
+    runs under that header's name (sway/config.c:719-729). The raw lines a
+    block keeps are untouched; reports print an undecodable byte as an
+    escape (printable).
+    """
+    header = node if isinstance(node, Line) else node.header
+    if UNDECODABLE.search(header.text):
+        text = header.text if isinstance(node, Line) else f"{header.text} {{"
+        doc.warn(header.pos.path, header.pos.line, text, UNDECODABLE_REFUSED)
+        return None
+    if isinstance(node, Line):
+        return node
+    body = [kept for child in node.body if (kept := decodable(child, doc)) is not None]
+    return replace(node, body=body)
 
 
 class Frontend:
@@ -720,72 +720,104 @@ class Frontend:
         self.variables[name] = self.expand(value.strip()).replace(r"\$", "$")
 
     def run(
-        self, path: Path, doc: Translator
-    ) -> Iterator[tuple[Directive, LegacyReader]]:
-        path = path.expanduser().resolve()
+        self, path: Path, doc: Translator, include: Directive | None = None
+    ) -> Iterator[Directive]:
+        """The directives of the file at path; include is the directive that
+        includes it, and a file it cannot read is reported there."""
+        # realpath, as load_include_config compares real paths
+        # (sway/config.c:560-578); a symlink loop then fails to read.
+        path = Path(os.path.realpath(os.path.expanduser(path)))
         if path in self.visited:
             return
         try:
-            reader = LegacyReader.open(path)
+            nodes = read_config(path)
         except OSError as error:
-            doc.warn(path, 0, "include", f"cannot read include: {error}")
+            if include is None:
+                doc.warn(path, 0, "include", f"cannot read include: {error}")
+            else:
+                reason = f"cannot read included file {path}: {error.strerror or error}"
+                doc.warn(include.pos.path, include.pos.line, include.text, reason)
             return
         self.visited.add(path)
-
-        while (line := reader.next_line()) is not None:
-            line_no = line.pos.line
-            text = line.text
-
-            if re.fullmatch(r"set\s*\{", text):
-                body = reader.take_body(text)
-                self.translate_set_block(doc, path, line_no, body)
+        for node in nodes:
+            if isinstance(node, Block) and split_args(node.header.text) == [
+                COMMANDS_BLOCK
+            ]:
+                header = node.header
+                doc.warn(path, header.pos.line, f"{header.text} {{", COMMANDS_BLOCK_REFUSED)
                 continue
-            if match := re.fullmatch(r"set\s+(\$+[^\s]+)\s+(.+)", text):
+            if isinstance(node, Block) and block_depth(node) > MAX_BLOCK_DEPTH:
+                header = node.header
+                doc.warn(path, header.pos.line, f"{header.text} {{", DEEP_BLOCK_REFUSED)
+                continue
+            node = decodable(node, doc)
+            if node is None:
+                continue
+            yield from self.walk([node], doc)
+            if isinstance(node, Block):
+                self.report_block_ends(node, doc)
+
+    def walk(
+        self, nodes: list[Line | Block], doc: Translator, prefix: str | None = None
+    ) -> Iterator[Directive]:
+        """The directives of nodes; prefix is the enclosing block's expanded name."""
+        for node in nodes:
+            if isinstance(node, Block):
+                header = self.expand(node.header.text).replace(r"\$", "$")
+                text = expand_line(prefix, header, True)
+                yield Directive.from_line(text, node.header.pos, node)
+                continue
+            if prefix is None and split_args(node.text)[-1:] == ["}"]:
+                doc.warn(node.pos.path, node.pos.line, node.text, UNMATCHED_BLOCK_END)
+                continue
+            if match := SET_DIRECTIVE.fullmatch(expand_line(prefix, node.text, False)):
                 self.define(match.group(1), match.group(2))
                 continue
-            text = self.expand(text).replace(r"\$", "$")
+            expanded = self.expand(node.text).replace(r"\$", "$")
+            yield Directive.from_line(expand_line(prefix, expanded, False), node.pos)
 
-            if text.startswith("include "):
-                yield from self.translate_include(doc, path, line_no, text)
-                continue
-            yield Directive.from_line(text, line.pos), reader
+    def report_block_ends(self, block: Block, doc: Translator) -> None:
+        if block.end is not None and block.end.text != "}":
+            end = block.end
+            doc.warn(end.pos.path, end.pos.line, end.text, INNER_BLOCK_END)
+        for node in block.body:
+            if isinstance(node, Block):
+                self.report_block_ends(node, doc)
 
-    def translate_set_block(
-        self, doc: Translator, source: Path, line: int, body: list[str]
-    ) -> None:
-        for offset, item in enumerate(body, 1):
-            item = item.strip()
-            if not item or item.startswith("#"):
-                continue
-            if match := re.fullmatch(r"(\$+[^\s]+)\s+(.+)", item):
-                self.define(match.group(1), match.group(2))
-            else:
-                doc.warn(source, line + offset, item, "malformed directive in set block")
+    def include_files(self, doc: Translator, d: Directive) -> Iterator[Directive]:
+        """The directives of the files include directive d names, in order.
 
-    def translate_include(
-        self, doc: Translator, source: Path, line: int, text: str
-    ) -> Iterator[tuple[Directive, LegacyReader]]:
-        pattern = legacy_unquote(text.removeprefix("include ").strip(), "\"'")
+        Sway skips a file it cannot read (sway/config.c:560-565); each one
+        is reported on d, and translation goes on after it.
+        """
+        # cmd_include joins its arguments (sway/commands/include.c:9).
+        source, line, text = d.pos.path, d.pos.line, d.text
+        pattern = join_args(d.args)
         if "`" in pattern or "$(" in pattern:
             doc.warn(source, line, text, "include command substitution is refused")
             return
-        pattern_path = Path(pattern).expanduser()
+        try:
+            pattern_path = Path(pattern).expanduser()
+        except RuntimeError:  # `~user` for no user Python can look up
+            doc.warn(source, line, text, f"cannot find the home directory in {pattern}")
+            return
         if not pattern_path.is_absolute():
             pattern_path = source.parent / pattern_path
         matches = sorted(glob.glob(str(pattern_path)))
         if not matches:
             doc.warn(source, line, text, "include matched no files")
         for included in matches:
-            yield from self.run(Path(included), doc)
+            yield from self.run(Path(included), doc, d)
 
 
 # ---------------------------------------------------------------------------
 # Handlers
 #
-# Report, the handlers' own helpers, and Translator: dispatch, one handler
-# per branch of the old elif chain (in its order) and the translate_*
-# helpers they call. They build nodes on a Document (see KDL IR); render()
-# turns it into text. The handler tables follow the class.
+# Report, the handlers' own helpers, and Translator: dispatch, the handlers
+# and the translate_* helpers they call. They build nodes on a Document (see
+# KDL IR); render() turns it into text. The handler tables follow the class.
+# Most handlers parse Directive.text with regexes and str.split rather than
+# Directive.args, so their arguments are not unescaped.
 # ---------------------------------------------------------------------------
 
 
@@ -801,18 +833,77 @@ class Report:
     pos: Pos
     reason: str
     text: str
-    located: bool = True  # False: the comment omits "{pos}: "
 
     @property
     def item(self) -> str:
         location = (
             f"{self.pos.path}:{self.pos.line}" if self.pos.line else str(self.pos.path)
         )
-        return f"{location}: {self.reason}: {self.text}"
+        return printable(f"{location}: {self.reason}: {self.text}")
 
-    @property
-    def comment(self) -> str:
-        return self.item if self.located else f"{self.reason}: {self.text}"
+
+INT_MIN, INT_MAX = -(2**31), 2**31 - 1
+
+NUMBER_OUT_OF_RANGE = "number out of range: sway stores it in a C int, which cannot hold it"
+
+
+class NumberError(ValueError):
+    """A number sway reads into a C int that cannot hold it."""
+
+
+def c_int(text: str) -> int:
+    """text, an optional sign and ASCII digits, as the int sway stores.
+
+    Sway reads these numbers with strtol into an int
+    (sway/commands/gaps.c:56, workspace.c:79, floating_minmax_size.c:24,33,
+    force_display_urgency_hint.c:14, common/util.c:89). strtol saturates at
+    LONG_MAX and the conversion keeps the low bits, so sway stores another
+    number for a value outside INT_MIN..INT_MAX; that raises NumberError, as
+    does text of another shape. The digits are measured as text first, so
+    no length reaches int(), which refuses over 4300 digits on Python 3.11+.
+    """
+    match = re.fullmatch(r"([+-]?)0*([0-9]+)", text)
+    if match is None:
+        raise NumberError(f"expected an integer: {text}")
+    sign, digits = match.groups()
+    if len(digits) > len(str(INT_MAX)):
+        raise NumberError(NUMBER_OUT_OF_RANGE)
+    value = int(sign + digits)
+    if not INT_MIN <= value <= INT_MAX:
+        raise NumberError(NUMBER_OUT_OF_RANGE)
+    return value
+
+
+U16_MAX = 65535
+
+
+def border_width(text: str) -> int | None:
+    """text, ASCII digits, as a border width swayward holds, or None.
+
+    swayward stores border widths as u16 (swayward-config/src/layout.rs:446,
+    window_rule.rs:45,49). Leading zeroes are dropped and the rest is
+    measured as text before int(), which refuses over 4300 digits on
+    Python 3.11+.
+    """
+    if re.fullmatch(r"[0-9]+", text) is None:
+        return None
+    digits = text.lstrip("0") or "0"
+    if len(digits) > len(str(U16_MAX)):
+        return None
+    value = int(digits)
+    return value if value <= U16_MAX else None
+
+
+# The decimal forms strtof reads, in ASCII.
+DECIMAL = re.compile(r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?")
+
+
+def unit_fraction(text: str) -> float | None:
+    """text as a decimal number from 0 to 1, or None."""
+    if DECIMAL.fullmatch(text) is None:
+        return None
+    value = float(text)  # an exponent past the float range reads as inf
+    return value if 0.0 <= value <= 1.0 else None
 
 
 def preset_size(name: str, kind: str, value: Value) -> Node:
@@ -825,127 +916,170 @@ def background_effect(name: str, value: str) -> Node:
     return Node("background-effect", children=[Node(name, [value in {"enable", "on"}])])
 
 
+def set_background_effect(rule: Node, name: str, value: str) -> None:
+    """Set one effect in rule's background-effect, keeping the others."""
+    set_merged(rule, background_effect(name, value))
+
+
 def shadow(value: str) -> Node:
     """`shadow { on }` from a SwayFX enable/disable word."""
     return Node("shadow", children=[Node("on" if value in {"enable", "on"} else "off")])
 
 
-def legacy_unlocated_report(pos: Pos, reason: str, text: str) -> Report:
-    return Report(pos, reason, text, located=False)
-
-
-def legacy_unquote(text: str, quotes: str) -> str:
-    """A selector or name with any of quotes stripped from both ends."""
-    return text.strip(quotes)
-
-
-def legacy_command_list(command: str) -> list[str]:
-    """for_window's commands, split on every `,` and `;`.
-
-    Empty segments are dropped, as sway ignores them
-    (sway/sway/commands.c:257-260).
-    """
-    return [
-        directive
-        for directive in re.split(r"\s*,\s*|\s*;\s*", command)
-        if directive.strip()
-    ]
-
-
-def legacy_layer_effects(effects: str) -> list[str]:
-    """layer_effects' effects: braces stripped from both ends, split on `;`."""
-    return re.split(r"\s*;\s*", effects.strip().strip("{} "))
-
-
-def legacy_bar_echo(block: Block) -> str:
-    """The bar report's text: LegacyReader's block list joined with " | "."""
-    return " | ".join(block.raw)
-
-
-def legacy_mode_nested_line(header: int) -> int:
-    """The line a block nested in a mode numbers its body from.
-
-    translate_mode passes the line above the nested header, so each report
-    from the nested body names the line above its own.
-    """
-    return header - 1
-
-
-def legacy_keep_first(binds: dict[tuple, Node], key: tuple, node: Node) -> bool:
-    """Bind node under key unless key is bound already; False when it is."""
-    if key in binds:
-        return False
-    binds[key] = node
-    return True
-
-
-LEGACY_TRAILING_BIND_OPTIONS = {
-    "--release",
-    "--whole-window",
-    "--border",
-    "--exclude-titlebar",
+# Sway's modifier names, matched ignoring case (sway/input/keyboard.c:24-50),
+# with the wlr modifier bit sway stores, spelled as swayward's KDL key parser
+# reads them (swayward-config/src/binds/key.rs:70-101). That parser maps Mod3
+# and Mod5 to the ISO level shifts of the conventional XKB map, so they are
+# written by those names.
+SWAY_MODIFIERS: dict[str, tuple[str, int]] = {
+    "shift": ("Shift", 1),
+    "lock": ("Lock", 2),
+    "control": ("Control", 4),
+    "ctrl": ("Ctrl", 4),
+    "mod1": ("Alt", 8),
+    "alt": ("Alt", 8),
+    "mod2": ("Num", 16),
+    "mod3": ("ISO_Level5_Shift", 32),
+    "mod4": ("Super", 64),
+    "super": ("Super", 64),
+    "mod5": ("ISO_Level3_Shift", 128),
 }
 
+# A `+` part that starts with this prefix names an XKB group, compared
+# case-sensitively (sway/commands/bind.c:401-416). swayward's KDL writes the
+# same Group1 to Group4 (swayward-config/src/binds/decode.rs:177-201).
+SWAY_GROUP_PREFIX = "Group"
+# The i3 alias for Group2; unlike a GroupN part it is also one of the
+# binding's keys (sway/commands/bind.c:417-427).
+SWAY_MODE_SWITCH = "Mode_switch"
 
-def legacy_bind_trailing_options(command: str) -> tuple[list[str], str]:
-    """The options that open a bind command, and the command without them."""
-    options: list[str] = []
-    while command.startswith("--"):
-        option, separator, remainder = command.partition(" ")
-        if not separator or option not in LEGACY_TRAILING_BIND_OPTIONS:
-            break
-        options.append(option)
-        command = remainder.lstrip()
-    return options, command
-
-
-def legacy_exec_unquote(command: str) -> str:
-    """An exec command with one matching pair of outer quotes stripped."""
-    if command[:1] in {"\"", "'"} and command[-1:] == command[0]:
-        return command[1:-1]
-    return command
-
-
-def legacy_unescape_at(command: str) -> str:
-    """A bind command with every `\\@` replaced by `@`."""
-    return command.replace(r"\@", "@")
-
-
-def legacy_command_spelling(command: str) -> str:
-    """A bind command in the spellings swayward's parser once required."""
-    command = re.sub(
-        r"^move\s+container\s+to\s+workspace", "move to workspace", command
-    )
-    command = re.sub(r"^splith$", "split h", command)
-    command = re.sub(r"^splitv$", "split v", command)
-    return re.sub(
-        r"^(resize\s+(?:grow|shrink)\s+(?:width|height))\s+(\d+)px$",
-        r"\1 \2 px",
-        command,
-    )
-
-
-LEGACY_MODIFIER_ALIASES = {
-    "Mod4": "Super",
-    "Mod1": "Alt",
-    "Shift": "Shift",
-    "Lock": "Lock",
-    "Control": "Control",
-    "Ctrl": "Ctrl",
-    "Alt": "Alt",
-    "Mod2": "Num",
-    # Sway's default XKB map assigns Mod5 to ISO_Level3_Shift. swayward's
-    # compatibility spelling keeps that semantic name instead of the X11 bit.
-    "Mod5": "ISO_Level3_Shift",
-    "Super": "Super",
-    # sway spells an XKB group qualifier Group1..Group4, with Mode_switch
-    # as an alias for Group2. The typed KDL parser accepts the same names.
-    "Group1": "Group1",
-    "Group2": "Group2",
-    "Group3": "Group3",
-    "Group4": "Group4",
-    "Mode_switch": "Mode_switch",
+# SWAY_SCROLL_UP is KEY_MAX + 1 (include/sway/input/cursor.h:13-16).
+SWAY_SCROLL_UP = 0x2FF + 1
+# Mouse buttons by the names sway binds: the button code get_mouse_bindsym
+# returns (sway/input/cursor.c:1203-1226), which binding_key_compare
+# compares, and swayward's KDL trigger. BTN_SIDE and BTN_BACK are distinct
+# buttons to sway and one trigger to swayward's KDL, as are BTN_EXTRA and
+# BTN_FORWARD.
+MOUSE_BUTTONS = {
+    "button1": (0x110, "MouseLeft"),
+    "button2": (0x112, "MouseMiddle"),
+    "button3": (0x111, "MouseRight"),
+    "button4": (SWAY_SCROLL_UP, "WheelScrollUp"),
+    "button5": (SWAY_SCROLL_UP + 1, "WheelScrollDown"),
+    "button6": (SWAY_SCROLL_UP + 2, "WheelScrollLeft"),
+    "button7": (SWAY_SCROLL_UP + 3, "WheelScrollRight"),
+    "button8": (0x113, "MouseBack"),
+    "button9": (0x114, "MouseForward"),
+    "BTN_LEFT": (0x110, "MouseLeft"),
+    "BTN_MIDDLE": (0x112, "MouseMiddle"),
+    "BTN_RIGHT": (0x111, "MouseRight"),
+    "BTN_SIDE": (0x113, "MouseBack"),
+    "BTN_BACK": (0x116, "MouseBack"),
+    "BTN_EXTRA": (0x114, "MouseForward"),
+    "BTN_FORWARD": (0x115, "MouseForward"),
 }
+MOUSE_TRIGGERS = {name: trigger for name, (_, trigger) in MOUSE_BUTTONS.items()}
+# swayward's KDL pointer triggers, matched ignoring case
+# (swayward-config/src/binds/key.rs:118-148). None is an XKB keysym, so sway
+# refuses each as an unknown key (sway/commands/bind.c:194-199).
+KDL_POINTER_TRIGGERS = frozenset(
+    name.lower()
+    for name in (
+        "MouseLeft", "MouseRight", "MouseMiddle", "MouseBack", "MouseForward",
+        "WheelScrollDown", "WheelScrollUp", "WheelScrollLeft", "WheelScrollRight",
+        "TouchpadScrollDown", "TouchpadScrollUp", "TouchpadScrollLeft",
+        "TouchpadScrollRight", "TabletStylusButton1", "TabletStylusButton2",
+        "TabletStylusButton3",
+    )
+)
+
+
+def sway_mouse_button(name: str) -> str | None:
+    """The MOUSE_BUTTONS name sway's get_mouse_bindsym reads name as, or None
+    for a keysym.
+
+    `button` is matched ignoring case and `BTN_` exactly
+    (sway/input/cursor.c:1203-1226). A result missing from MOUSE_BUTTONS is
+    a button sway refuses or swayward cannot bind.
+    """
+    if ascii_lower(name).startswith("button"):
+        return ascii_lower(name)
+    if name.startswith("BTN_"):
+        return name
+    return None
+
+
+@dataclass
+class Binding:
+    """A translated binding under sway's identity (Translator.translate_bind)."""
+
+    kdl: tuple  # the identity swayward's KDL gives the node
+    node: Node
+    pos: Pos
+    command: str
+
+
+class BindError(ValueError):
+    """A key combination sway rejects, or one swayward's KDL cannot bind."""
+
+
+@dataclass
+class KeyCombo:
+    """A bind's key argument as cmd_bindsym_or_bindcode reads it."""
+
+    modifiers: list[str]  # KDL spellings, in source order
+    mask: int  # the wlr modifier bits, as binding_key_compare sees them
+    group: int | None  # 1 to 4
+    keys: list[str]  # every other part, in source order; Mode_switch included
+    mode_switch: bool
+
+
+def split_key_combo(combo: str) -> KeyCombo:
+    """Sway's loop over a bind's `+` parts (sway/commands/bind.c:398-453).
+
+    split_string drops empty parts. A part that starts with "Group" names a
+    group, Group1 to Group4 by strtol, and only one group is allowed.
+    Mode_switch sets group 2 and then, like every part that is not a
+    modifier, is a key. Raises BindError with sway's message for a bad group.
+    """
+    result = KeyCombo([], 0, None, [], False)
+    for part in (p for p in combo.split("+") if p):
+        if part.startswith(SWAY_GROUP_PREFIX):
+            if result.group is not None:
+                raise BindError("only one group can be specified")
+            # strtol with nothing left over (bind.c:408-410). The digits
+            # are compared as text, so no length reaches int().
+            number = re.fullmatch(
+                r"[ \f\n\r\t\v]*\+?0*([1-4])", part[len(SWAY_GROUP_PREFIX) :]
+            )
+            if number is None:
+                raise BindError(f"invalid group {part}")
+            result.group = int(number.group(1))
+            continue
+        if part == SWAY_MODE_SWITCH:
+            if result.group is not None:
+                raise BindError("only one group can be specified")
+            result.group = 2
+            result.mode_switch = True
+        modifier = SWAY_MODIFIERS.get(ascii_lower(part))
+        if modifier is not None:
+            result.modifiers.append(modifier[0])
+            result.mask |= modifier[1]
+            continue
+        result.keys.append(part)
+    return result
+
+
+# The text of a quoted criteria value: each character matches one way, a
+# backslash only with the character after it, so a scan takes time linear in
+# the line. The (?<!\w) before a criteria token keeps finditer from retrying
+# inside a word.
+QUOTED_VALUE = r'(?:[^"\\]|\\.)*'
+
+TRANSLATOR_FAILED = "sway-to-kdl failed on this directive; translate it by hand"
+READER_FAILED = (
+    "sway-to-kdl failed reading the config and stopped; translate the rest by hand"
+)
 
 
 class Translator:
@@ -960,138 +1094,141 @@ class Translator:
         self.doc.note(f"sway-to-kdl: satisfied by swayward defaults: {text.strip()}")
 
     def parse(self, path: Path) -> None:
-        for directive, reader in self.frontend.run(path, self):
-            self.dispatch(directive, reader)
+        """Translate the config at path, with every file it includes.
 
-    def dispatch(self, d: Directive, reader: LegacyReader) -> None:
-        """Today's elif chain, as two lookups keyed by directive name.
+        The directives come from a stack of sources: the file, then each
+        block body and included file on top of the source that names it, so
+        they run in sway's order (sway/config.c:795-796,
+        sway/commands/include.c:11). A loop over the stack rather than
+        recursion keeps any include depth off Python's recursion limit;
+        sway sets no include depth limit either (sway/config.c:555-624).
 
-        For every name, the chain tried each branch that opens a block before
-        any that does not, so the block handler goes first; either returns
-        False when none of its patterns matches. The SwayFX names were tried
-        only after every sway branch failed; none is a sway name, so they
-        share the table.
+        A front-end failure while reading a block body or an included file
+        is reported on the directive that opened it, and translation goes
+        on after it; one while reading the config itself is reported and
+        stops.
         """
-        key = legacy_handler_key(d.text)
-        block_handler = BLOCK_HANDLERS.get(key)
-        if block_handler is not None and block_handler(self, d, reader):
-            return
-        handler = HANDLERS.get(key)
-        if handler is None or not handler(self, d):
+        stack: list[tuple[Directive | None, Iterator[Directive]]] = [
+            (None, self.frontend.run(path, self))
+        ]
+        while stack:
+            opened_by, source = stack[-1]
+            try:
+                directive = next(source, None)
+            except Exception as error:  # the front end's own failure, unforeseen
+                stack.pop()
+                if opened_by is None:
+                    self.warn(path, 0, repr(error), READER_FAILED)
+                else:
+                    d = opened_by
+                    reason = f"{TRANSLATOR_FAILED} ({error!r})"
+                    self.warn(d.pos.path, d.pos.line, d.text, reason)
+                continue
+            if directive is None:
+                stack.pop()
+                continue
+            nested = self.dispatch(directive)
+            if nested is not None:
+                stack.append((directive, nested))
+
+    def dispatch(self, d: Directive) -> Iterator[Directive] | None:
+        """Run d through the handler for its name, ignoring ASCII case
+        (sway/commands.c:145-149).
+
+        A handler returns False when it does not translate the line, which is
+        then reported as unhandled. A block goes to its block handler; one
+        without, or one its handler declines, runs line by line with the
+        block's name as prefix (sway/config.c:719-729,795-796), and its
+        header and closing line run nothing (sway/commands.c:355-366).
+
+        Such a block's lines, and an include's files, are returned as the
+        source parse runs next.
+
+        Every input a handler refuses gets a report of its own. An exception
+        none foresaw becomes one report for the directive that raised it,
+        and translation goes on with the next.
+        """
+        try:
+            return self.dispatch_unguarded(d)
+        except Exception as error:
+            self.warn(d.pos.path, d.pos.line, d.text, f"{TRANSLATOR_FAILED} ({error!r})")
+            return None
+
+    def dispatch_unguarded(self, d: Directive) -> Iterator[Directive] | None:
+        lowered = d.lowered()
+        if d.block is not None:
+            block_handler = BLOCK_HANDLERS.get(lowered.name)
+            if block_handler is None or not block_handler(self, lowered):
+                return self.frontend.walk(d.block.body, self, block_name(d.text))
+            return None
+        if lowered.name == "include" and d.args:
+            return self.frontend.include_files(self, d)
+        handler = HANDLERS.get(lowered.name)
+        if handler is None or not handler(self, lowered):
             self.warn(d.pos.path, d.pos.line, d.text, "unhandled")
+        return None
 
-    def h_bar_block(self, d: Directive, reader: LegacyReader) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if re.match(r"bar\s*\{", text):
-            self.warn(
-                path,
-                line_no,
-                legacy_bar_echo(reader.take_block(text)),
-                "bar blocks are unsupported; use waybar "
-                "(docs/SWAY_CONFIG_MIGRATION.md#replace-swaybar)",
-            )
-        else:
-            return False
+    def h_bar_block(self, d: Directive) -> bool:
+        # One report for the whole block, echoing its source lines.
+        echo = " | ".join(line.strip(SWAY_WHITESPACE) for line in d.block.raw)
+        self.warn(
+            d.pos.path,
+            d.pos.line,
+            echo,
+            "bar blocks are unsupported; use waybar "
+            "(docs/SWAY_CONFIG_MIGRATION.md#replace-swaybar)",
+        )
         return True
 
-    def h_mode_block(self, d: Directive, reader: LegacyReader) -> bool:
+    def h_mode_block(self, d: Directive) -> bool:
+        args = d.args[:-1]  # without the "{"
+        pango_markup = args[:1] == ["--pango_markup"]
+        if pango_markup:
+            args = args[1:]
+        if len(args) != 1:
+            return False
+        # cmd_mode strips the quotes from the name itself (sway/commands/mode.c:42).
+        self.translate_mode(
+            strip_quotes(args[0]), body_lines(d.block.body), pango_markup
+        )
+        return True
+
+    def h_for_window_block(self, d: Directive) -> bool:
         path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(
-            r'mode\s+(--pango_markup\s+)?("[^"]+"|\S+)\s*\{', text
+        if match := re.fullmatch(
+            rf'for_window\s*(\[(?:[^"\]]|"{QUOTED_VALUE}")+\])\s*\{{', text
         ):
-            self.translate_mode(
-                path,
-                line_no,
-                legacy_unquote(match.group(2), '"'),
-                reader.take_body(text),
-                match.group(1) is not None,
-            )
+            body = [line.text for line in body_lines(d.block.body)]
+            self.translate_for_window_commands(path, line_no, match.group(1), body)
         else:
             return False
         return True
 
-    def h_bind_block(self, d: Directive, reader: LegacyReader) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.fullmatch(r"(bindsym|bindcode)(.*?)\s*\{", text):
-            self.translate_bind_block(
-                path, line_no, match.group(1), match.group(2), reader.take_body(text)
-            )
-        else:
+    def h_device_block(self, d: Directive) -> bool:
+        if len(d.argv) < 3:
             return False
+        body = [line.text for line in body_lines(d.block.body)]
+        extra = d.argv[2:-1]  # header words after the selector prefix each line
+        if extra:
+            body = [expand_line(join_args(extra), item, False) for item in body]
+        self.translate_device_block(d, d.args[0], body)
         return True
 
-    def h_exec_block(self, d: Directive, reader: LegacyReader) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.fullmatch(r"(exec|exec_always)\s*\{", text):
-            self.translate_exec_block(
-                path, line_no, match.group(1), reader.take_body(text)
-            )
-        else:
+    def h_device(self, d: Directive) -> bool:
+        if len(d.argv) < 3:
             return False
-        return True
-
-    def h_for_window_block(self, d: Directive, reader: LegacyReader) -> bool:
-        # The chain tried `for_window {` well before `for_window [..] {`;
-        # nothing between them matches a line starting with for_window.
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if re.fullmatch(r"for_window\s*\{", text):
-            self.translate_for_window_block(path, line_no, reader.take_body(text))
-        elif match := re.fullmatch(
-            r'for_window\s*(\[(?:[^"\]]|"(?:\\.|[^"])*")+\])\s*\{', text
-        ):
-            self.translate_for_window_commands(
-                path, line_no, match.group(1), reader.take_body(text)
-            )
-        else:
-            return False
-        return True
-
-    def h_device_block(self, d: Directive, reader: LegacyReader) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(r"(input|output)\s+(.+?)\s*\{", text):
-            self.translate_device_block(
-                path, line_no, match.group(1), match.group(2), reader.take_body(text)
-            )
-        else:
-            return False
-        return True
-
-    def h_input(self, d: Directive) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(r"input\s+(\S+)\s+(.+)", text):
-            self.translate_device_block(
-                path, line_no, "input", match.group(1), [match.group(2)]
-            )
-        else:
-            return False
-        return True
-
-    def h_output(self, d: Directive) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(r"output\s+(\S+)\s+(.+)", text):
-            self.translate_device_block(
-                path, line_no, "output", match.group(1), [match.group(2)]
-            )
-        else:
-            return False
+        settings = text_after(d.text, d.argv, 2)
+        self.translate_device_block(d, d.args[0], [settings])
         return True
 
     def h_bind(self, d: Directive) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(r"(bindsym|bindcode)\s+(.+)", text):
-            self.translate_bind(path, line_no, match.group(1), match.group(2))
-        else:
+        if not d.args:
             return False
+        self.translate_bind(d)
         return True
 
     def h_exec(self, d: Directive) -> bool:
-        path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.fullmatch(r"(exec|exec_always)(?:\s+(.*))?", text):
-            self.translate_exec(
-                path, line_no, text, match.group(1), match.group(2) or ""
-            )
-        else:
-            return False
+        self.translate_exec(d)
         return True
 
     def h_nop(self, d: Directive) -> bool:
@@ -1113,7 +1250,7 @@ class Translator:
     def h_for_window(self, d: Directive) -> bool:
         path, line_no, text = d.pos.path, d.pos.line, d.text
         if match := re.match(
-            r'for_window\s*(\[(?:[^"\]]|"(?:\\.|[^"])*")+\])\s+(.+)', text
+            rf'for_window\s*(\[(?:[^"\]]|"{QUOTED_VALUE}")+\])\s+(.+)', text
         ):
             self.translate_for_window(path, line_no, match.group(1), match.group(2))
         elif text.startswith("for_window"):
@@ -1137,34 +1274,40 @@ class Translator:
 
     def h_assign(self, d: Directive) -> bool:
         path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.match(r"assign\s+(\[[^]]+\])\s+(?:→|->)?\s*(.+)", text):
-            self.translate_assign(path, line_no, match.group(1), match.group(2))
-        else:
+        match = re.match(r"assign\s+(\[[^]]+\])\s+(.+)", text)
+        if match is None:
             return False
+        # The target is config_command's arguments after the criteria.
+        target = unquote_args(split_args(text[match.end(1) :]))
+        self.translate_assign(path, line_no, match.group(1), target)
         return True
 
     def h_workspace(self, d: Directive) -> bool:
-        # The chain tried the case-sensitive `workspace X output` before the
-        # gaps branches and `workspace X gaps`, which ignores case, after them.
         path, line_no, text = d.pos.path, d.pos.line, d.text
-        if match := re.fullmatch(r"workspace\s+(.+?)\s+output\s+(.+)", text):
-            workspace = legacy_unquote(match.group(1), '"')
-            outputs = [legacy_unquote(output, '"') for output in match.group(2).split()]
+        # The name is the arguments before `output` or `gaps`, joined
+        # (sway/commands/workspace.c:130-166).
+        args = d.args
+        output = next((i for i, arg in enumerate(args) if arg == "output"), 0)
+        gaps = next((i for i, arg in enumerate(args) if ascii_lower(arg) == "gaps"), 0)
+        if output and len(args) > output + 1:
+            workspace = join_args(args[:output])
             # Sway appends every output to one workspace_config in source
             # order (sway/commands/workspace.c:153-161).
-            legacy_workspace_assignment(self.doc, workspace).args.extend(outputs)
-        elif match := re.fullmatch(
-            r"workspace\s+(.+?)\s+gaps\s+(inner|outer|horizontal|vertical|top|right|bottom|left)\s+(.+)",
-            text,
-            re.IGNORECASE,
+            self.doc.workspace_assignment(workspace).args.extend(args[output + 1 :])
+        elif gaps and (
+            match := re.fullmatch(
+                r"(inner|outer|horizontal|vertical|top|right|bottom|left)\s+(.+)",
+                " ".join(args[gaps + 1 :]),
+                re.IGNORECASE,
+            )
         ):
             self.translate_gaps(
                 path,
                 line_no,
                 text,
+                match.group(1),
                 match.group(2),
-                match.group(3),
-                legacy_unquote(match.group(1), '"'),
+                join_args(args[:gaps]),
             )
         else:
             return False
@@ -1234,15 +1377,19 @@ class Translator:
     def h_floating_size(self, d: Directive) -> bool:
         path, line_no, text = d.pos.path, d.pos.line, d.text
         if match := re.fullmatch(
-            r"(floating_minimum_size|floating_maximum_size)\s+(-?\d+)\s+(x)\s+(-?\d+)",
+            r"(floating_minimum_size|floating_maximum_size)\s+(-?[0-9]+)\s+(x)\s+(-?[0-9]+)",
             text,
         ):
-            width, height = int(match.group(2)), int(match.group(4))
+            try:
+                width, height = c_int(match.group(2)), c_int(match.group(4))
+            except NumberError as error:
+                self.warn(path, line_no, text, str(error))
+                return True
             if width < -1 or height < -1:
                 self.warn(path, line_no, text, "floating size below -1 is unsupported")
             else:
                 name = match.group(1).replace("_", "-")
-                legacy_add(self.doc.layout, Node(name, [width, height]))
+                self.doc.layout.set(Node(name, [width, height]))
         else:
             return False
         return True
@@ -1270,7 +1417,7 @@ class Translator:
         if match := re.fullmatch(r"workspace_layout\s+(\S+)", text, re.IGNORECASE):
             value = match.group(1).lower()
             if value in {"default", "stacking", "tabbed"}:
-                legacy_add(self.doc.layout, Node("workspace-layout", [value]))
+                self.doc.layout.set(Node("workspace-layout", [value]))
             else:
                 self.warn(path, line_no, text, "unsupported workspace layout")
         else:
@@ -1361,7 +1508,7 @@ class Translator:
             enabled = match.group(1).lower() in {
                 "1", "yes", "on", "true", "enable", "enabled", "active"
             }
-            legacy_add(self.doc.input, Node("tiling-drag", [enabled]))
+            self.doc.input.set(Node("tiling-drag", [enabled]))
         else:
             return False
         return True
@@ -1369,9 +1516,7 @@ class Translator:
     def h_tiling_drag_threshold(self, d: Directive) -> bool:
         text = d.text
         if match := re.fullmatch(r"tiling_drag_threshold\s+(\d+)", text):
-            legacy_add(
-                self.doc.input, Node("tiling-drag-threshold", [Raw(match.group(1))])
-            )
+            self.doc.input.set(Node("tiling-drag-threshold", [Raw(match.group(1))]))
         else:
             return False
         return True
@@ -1382,8 +1527,8 @@ class Translator:
             enabled = match.group(1).lower() in {
                 "1", "yes", "on", "true", "enable", "enabled", "active"
             }
-            legacy_add(
-                self.doc.layout, Node("focus-wrapping", ["force" if enabled else "yes"])
+            self.doc.layout.set(
+                Node("focus-wrapping", ["force" if enabled else "yes"])
             )
         else:
             return False
@@ -1394,7 +1539,7 @@ class Translator:
         if match := re.fullmatch(r"popup_during_fullscreen\s+(\S+?);?", text):
             value = match.group(1).lower()
             if value in {"smart", "ignore", "leave_fullscreen"}:
-                legacy_add(self.doc.body, Node("popup-during-fullscreen", [value]))
+                self.doc.body.set(Node("popup-during-fullscreen", [value]))
             else:
                 self.warn(
                     path,
@@ -1419,9 +1564,8 @@ class Translator:
             enabled = match.group(1).lower() in {
                 "1", "yes", "on", "true", "enable", "enabled", "active"
             }
-            legacy_add(
-                self.doc.input,
-                Node("workspace-auto-back-and-forth", [] if enabled else [False]),
+            self.doc.input.set(
+                Node("workspace-auto-back-and-forth", [] if enabled else [False])
             )
         else:
             return False
@@ -1459,9 +1603,9 @@ class Translator:
         if match := re.fullmatch(r"focus_wrapping\s+(\S+)", text, re.IGNORECASE):
             value = match.group(1).lower()
             if value in {"1", "yes", "on", "true", "enable", "enabled", "active"}:
-                legacy_add(self.doc.layout, Node("focus-wrapping", ["yes"]))
+                self.doc.layout.set(Node("focus-wrapping", ["yes"]))
             elif value in {"no", "force", "workspace"}:
-                legacy_add(self.doc.layout, Node("focus-wrapping", [value]))
+                self.doc.layout.set(Node("focus-wrapping", [value]))
             else:
                 self.warn(
                     path,
@@ -1486,9 +1630,7 @@ class Translator:
         if match := re.fullmatch(r"focus_on_window_activation\s+(\S+)", text):
             value = match.group(1)
             if value in {"smart", "urgent", "focus", "none"}:
-                legacy_add(
-                    self.doc.body, Node("focus-on-window-activation", [value])
-                )
+                self.doc.body.set(Node("focus-on-window-activation", [value]))
             else:
                 self.warn(path, line_no, text, "expected focus_on_window_activation smart|urgent|focus|none")
         else:
@@ -1496,15 +1638,18 @@ class Translator:
         return True
 
     def h_force_display_urgency_hint(self, d: Directive) -> bool:
-        text = d.text
+        path, line_no, text = d.pos.path, d.pos.line, d.text
         if match := re.fullmatch(
-            r"force_display_urgency_hint\s+(-?\d+)(?:\s*ms)?",
+            r"force_display_urgency_hint\s+(-?[0-9]+)(?:\s*ms)?",
             text,
             re.IGNORECASE,
         ):
-            self.doc.urgent_timeout = Node(
-                "urgent-timeout-ms", [max(0, int(match.group(1)))]
-            )
+            try:
+                timeout = c_int(match.group(1))
+            except NumberError as error:
+                self.warn(path, line_no, text, str(error))
+                return True
+            self.doc.urgent_timeout = Node("urgent-timeout-ms", [max(0, timeout)])
         else:
             return False
         return True
@@ -1515,10 +1660,13 @@ class Translator:
             enabled = match.group(1).lower() in {
                 "1", "yes", "on", "true", "enable", "enabled", "active"
             }
-            if not enabled:
-                legacy_add(
-                    self.doc.body,
-                    Node("clipboard", children=[Node("disable-primary")], inline=True),
+            # The last primary_selection wins
+            # (sway/commands/primary_selection.c:13-22).
+            if enabled:
+                self.doc.body.remove("clipboard")
+            else:
+                self.doc.body.set(
+                    Node("clipboard", children=[Node("disable-primary")], inline=True)
                 )
         else:
             return False
@@ -1532,10 +1680,12 @@ class Translator:
             # switched off, so only the disabled case emits anything.
             value = match.group(1).lower()
             if value in {"disable", "disabled", "no", "false", "0"}:
-                legacy_add(
-                    self.doc.body, Node("xwayland-satellite", children=[Node("off")])
+                self.doc.body.set(
+                    Node("xwayland-satellite", children=[Node("off")])
                 )
             elif value in {"enable", "enabled", "yes", "true", "1", "force"}:
+                # The last xwayland wins (sway/commands/xwayland.c:14-29).
+                self.doc.body.remove("xwayland-satellite")
                 self.satisfied(text)
             else:
                 self.warn(
@@ -1572,60 +1722,6 @@ class Translator:
     def h_swayfx(self, d: Directive) -> bool:
         return self.translate_swayfx(d.pos.path, d.pos.line, d.text)
 
-    def translate_bind_block(
-        self,
-        source: Path,
-        line: int,
-        kind: str,
-        options: str,
-        body: list[str],
-        binds: dict[tuple, Node] | None = None,
-    ) -> None:
-        options = options.strip()
-        prefix = f"{options} " if options else ""
-        for offset, item in enumerate(body, 1):
-            item = self.frontend.expand(item.strip()).replace(r"\$", "$")
-            if not item or item.startswith("#"):
-                continue
-            self.translate_bind(source, line + offset, kind, prefix + item, binds)
-
-    def translate_exec_block(
-        self, source: Path, line: int, directive: str, body: list[str]
-    ) -> None:
-        for offset, command in enumerate(body, 1):
-            command = self.frontend.expand(command.strip()).replace(r"\$", "$")
-            if not command or command.startswith("#"):
-                continue
-            self.translate_exec(
-                source,
-                line + offset,
-                f"{directive} {command}",
-                directive,
-                command,
-            )
-
-    def translate_for_window_block(
-        self, source: Path, line: int, body: list[str]
-    ) -> None:
-        for offset, item in enumerate(body, 1):
-            item = self.frontend.expand(item.strip()).replace(r"\$", "$")
-            if not item or item.startswith("#"):
-                continue
-            match = re.fullmatch(
-                r'(\[\s*(?:[^"\]]|"(?:\\.|[^"])*")+?\s*\])\s+(.+)', item
-            )
-            if match is None:
-                self.warn(
-                    source,
-                    line + offset,
-                    item,
-                    "grouped for_window entry needs criteria and a command",
-                )
-                continue
-            self.translate_for_window(
-                source, line + offset, match.group(1), match.group(2)
-            )
-
     def translate_for_window_commands(
         self, source: Path, line: int, criteria: str, body: list[str]
     ) -> None:
@@ -1642,19 +1738,17 @@ class Translator:
         words = arguments.split()
         style = words[0] if words else ""
         width = None
-        if match := re.fullmatch(r"(\d+)pixel", style):
-            if len(words) != 1:
+        if match := re.fullmatch(r"([0-9]+)pixel", style):
+            width = border_width(match.group(1))
+            if len(words) != 1 or width is None:
                 self.warn(source, line, text, "unsupported default border")
                 return
             style = "pixel"
-            width = match.group(1)
-        elif (
-            len(words) == 2
-            and words[1].isdigit()
-            and int(words[1]) <= 65535
-            and style in {"normal", "pixel"}
-        ):
-            width = words[1]
+        elif len(words) == 2 and style in {"normal", "pixel"}:
+            width = border_width(words[1])
+            if width is None:
+                self.warn(source, line, text, "unsupported default border")
+                return
         elif len(words) != 1 or style not in {"none", "normal", "pixel"}:
             self.warn(source, line, text, "unsupported default border")
             return
@@ -1662,15 +1756,15 @@ class Translator:
             self.warn(source, line, text, "unsupported default border")
             return
 
-        # These are layout defaults, not per-window rules. Emitting an
-        # unmatched window-rule applied the border to every window and could
-        # not be overridden by a later rule; layout.default-border is the
-        # setting the `default_border` IPC command also writes.
+        # These are layout defaults, not per-window rules: an unmatched
+        # window-rule would apply the border to every window and no later
+        # rule could override it. layout.default-border is the setting the
+        # `default_border` IPC command also writes.
         floating = directive in {"default_floating_border", "new_float"}
         name = "default-floating-border" if floating else "default-border"
-        props = [("width", Raw(width))] if width is not None else []
+        props = [("width", width)] if width is not None else []
         # A config may set the same default twice, and new_window/new_float
-        # are older spellings of the same settings. KDL rejects a duplicate
+        # are i3's aliases of the same settings. KDL rejects a duplicate
         # node, and sway's own behaviour is last-wins.
         self.doc.layout.set(Node(name, [style], props))
 
@@ -1687,8 +1781,12 @@ class Translator:
             )
             return
         modifier = words[0]
+        # cmd_floating_modifier takes a modifier name or none
+        # (sway/commands/floating_modifier.c:12-20).
         translated = (
-            "None" if modifier.lower() == "none" else self.translate_modifier(modifier)
+            "None"
+            if modifier.lower() == "none"
+            else SWAY_MODIFIERS.get(ascii_lower(modifier), (None, 0))[0]
         )
         if translated not in {"None", "Ctrl", "Shift", "Alt", "Super"}:
             self.warn(source, line, text, f"unsupported modifier {modifier}")
@@ -1709,15 +1807,16 @@ class Translator:
         self, source: Path, line: int, text: str, value: str
     ) -> None:
         value = value.lower()
+        # The last mouse_warping wins (sway/commands/mouse_warping.c:9-14).
         if value == "none":
+            self.doc.input.remove("warp-mouse-to-focus")
             return
         if value in {"container", "output"}:
             # KDL has no mouse-warping spelling, so approximate both enabled
             # modes with the inherited centering option. The note records the
             # narrower output-mode semantics so the conversion is not silent.
-            legacy_add(
-                self.doc.input,
-                Node("warp-mouse-to-focus", props=[("mode", "center-xy")]),
+            self.doc.input.set(
+                Node("warp-mouse-to-focus", props=[("mode", "center-xy")])
             )
             if value == "output":
                 self.doc.note(
@@ -1771,19 +1870,22 @@ class Translator:
             )
         self.warn(source, line, text, reason)
 
-    def translate_exec(
-        self, source: Path, line: int, text: str, directive: str, command: str
-    ) -> None:
-        command = command.strip()
-        if command.startswith("--no-startup-id") and (
-            len(command) == len("--no-startup-id")
-            or command[len("--no-startup-id")].isspace()
-        ):
-            command = command[len("--no-startup-id") :].strip()
-        if not command:
+    def translate_exec(self, d: Directive) -> None:
+        """exec and exec_always as cmd_exec_process builds the shell command
+        (sway/commands/exec_always.c:28-45): a leading --no-startup-id is
+        dropped, a single argument that starts with a quote loses its quotes,
+        and anything else is joined with single spaces."""
+        source, line, text, directive = d.pos.path, d.pos.line, d.text, d.name
+        args = d.args
+        if args[:1] == ["--no-startup-id"]:
+            args = args[1:]
+        if not args:
             self.warn(source, line, text, f"Expected '{directive} <command>'")
             return
-        command = legacy_exec_unquote(command)
+        if len(args) == 1 and args[0][:1] in {"'", '"'}:
+            command = strip_quotes(args[0])
+        else:
+            command = join_args(args)
         if directive == "exec_always":
             self.warn(
                 source,
@@ -1797,110 +1899,119 @@ class Translator:
         self.doc.body.add(Node("spawn-sh-at-startup", [command]))
 
     def translate_mode(
-        self, source: Path, line: int, name: str, body: list[str], pango_markup: bool
+        self, name: str, body: list[Line], pango_markup: bool
     ) -> None:
-        mode_binds: dict[tuple, Node] = {}
-        index = 0
-        while index < len(body):
-            offset = index + 1
-            text = body[index].strip()
-            index += 1
-            if not text or text.startswith("#"):
-                continue
-            if re.fullmatch(r"set\s*\{", text):
-                block, index = LegacyReader.scan_block(body, index, text)
-                self.frontend.translate_set_block(
-                    self, source, legacy_mode_nested_line(line + offset), block[1:-1]
-                )
-                continue
-            if match := re.fullmatch(r"set\s+(\$+[^\s]+)\s+(.+)", text):
+        mode_binds: dict[tuple, Binding] = {}
+        for item in body:
+            source, line, text = item.pos.path, item.pos.line, item.text
+            if match := SET_DIRECTIVE.fullmatch(text):
                 self.frontend.define(match.group(1), match.group(2))
                 continue
             text = self.frontend.expand(text).replace(r"\$", "$")
-            if match := re.fullmatch(r"(bindsym|bindcode)(.*?)\s*\{", text):
-                block, index = LegacyReader.scan_block(body, index, text)
-                self.translate_bind_block(
-                    source,
-                    legacy_mode_nested_line(line + offset),
-                    match.group(1),
-                    match.group(2),
-                    block[1:-1],
-                    mode_binds,
-                )
-            elif match := re.match(r"(bindsym|bindcode)\s+(.+)", text):
-                self.translate_bind(
-                    source, line + offset, match.group(1), match.group(2), mode_binds
-                )
+            # Mode subcommands are looked up ignoring case too
+            # (sway/commands/mode.c:11-21, sway/commands.c:145-149).
+            directive = Directive.from_line(text, item.pos).lowered()
+            text = directive.text
+            if directive.name in {"bindsym", "bindcode"} and directive.args:
+                self.translate_bind(directive, mode_binds)
             elif re.match(r"(?:un)?bind(?:gesture|switch)(?:\s|$)", text):
-                self.refuse_unsupported_binding(source, line + offset, text)
+                self.refuse_unsupported_binding(source, line, text)
             else:
-                self.warn(source, line + offset, text, f"unhandled directive in mode {name}")
+                self.warn(source, line, text, f"unhandled directive in mode {name}")
         self.doc.modes.append(
             Node(
                 "mode",
                 [name],
                 [("pango-markup", True)] if pango_markup else [],
-                list(mode_binds.values()),
+                [binding.node for binding in mode_binds.values()],
                 block=True,
             )
         )
 
     def translate_bind(
-        self,
-        source: Path,
-        line: int,
-        kind: str,
-        rest: str,
-        binds: dict[tuple, Node] | None = None,
+        self, d: Directive, binds: dict[tuple, Binding] | None = None
     ) -> None:
-        """Add one binding to binds, the default mode's unless given."""
+        """Add one binding to binds, the default mode's unless given.
+
+        Follows cmd_bindsym_or_bindcode (sway/commands/bind.c:323-491): the
+        options come before the key, the key is the next argument, and the
+        command is every argument after it, joined with single spaces. The
+        arguments are config_command's, unescaped with their quotes kept
+        (sway/commands.c:409-423), so the command reaches swayward's command
+        parser as sway's reaches execute_command.
+        """
         if binds is None:
             binds = self.doc.binds
+        source, line, kind, args = d.pos.path, d.pos.line, d.name, d.args
+
+        def echo(consumed: int) -> str:
+            # The directive's text after its name and the consumed arguments.
+            return text_after(d.text, d.argv, 1 + consumed)
+
         properties: list[tuple[str, Value]] = []
         mouse_regions: set[str] = set()
         exclude_titlebar = False
+        locked = False
+        warn = True
+        input_device = "*"
         region_options = {
             "--whole-window": {"titlebar", "border", "contents"},
             "--border": {"border"},
             "--exclude-titlebar": set(),
         }
-        rest = rest.strip()
-        while rest.startswith("--"):
-            input_match = re.match(r'--input-device=(?:"([^"]*)"|\'([^\']*)\'|(\S+))\s+', rest)
-            if input_match:
-                device = next(value for value in input_match.groups() if value is not None)
-                properties.append(("input-device", device))
-                rest = rest[input_match.end() :]
-                continue
-            option, separator, rest = rest.partition(" ")
-            if not separator:
-                self.warn(source, line, rest, f"malformed {kind}")
+        index = 0
+        while index < len(args) and args[index].startswith("--"):
+            option = args[index]
+            index += 1
+            if option.startswith("--input-device="):
+                # The last --input-device is the binding's (bind.c:370-373).
+                input_device = strip_quotes(option[len("--input-device=") :])
+                properties = [p for p in properties if p[0] != "input-device"]
+                properties.append(("input-device", input_device))
+            elif index == len(args):
+                self.warn(source, line, echo(index), f"malformed {kind}")
                 return
-            rest = rest.lstrip()
-            if option == "--locked":
+            elif option == "--locked":
                 properties.append(("allow-when-locked", True))
+                locked = True
             elif option == "--no-repeat":
                 properties.append(("repeat", False))
             elif option == "--release":
                 properties.extend((("release", True), ("repeat", False)))
+            elif option == "--no-warn":
+                warn = False
             elif option in region_options:
                 mouse_regions.update(region_options[option])
                 exclude_titlebar |= option == "--exclude-titlebar"
             else:
-                self.warn(source, line, rest, f"unsupported {kind} option {option}")
+                self.warn(
+                    source, line, echo(index), f"unsupported {kind} option {option}"
+                )
                 return
 
-        key, separator, command = rest.partition(" ")
-        if not separator or not command.strip():
+        rest = echo(index)
+        if len(args) - index < 2:
             self.warn(source, line, rest, f"malformed {kind}")
             return
+        combo_text = args[index]
+        command = join_args(args[index + 1 :])
+        try:
+            combo = split_key_combo(combo_text)
+        except BindError as error:
+            self.warn(source, line, rest, str(error))
+            return
+        keycode = None
         if kind == "bindcode":
-            parts = key.split("+")
-            code = parts.pop()
-            if not code.isdecimal():
+            code = combo.keys[-1] if combo.keys else ""
+            if not re.fullmatch(r"[0-9]+", code):
                 self.warn(source, line, rest, "bindcode key must be numeric")
                 return
-            if not 8 <= int(code) <= 255:
+            # Sway compares the number strtol reads (bind.c:166), so 024 and
+            # 24 are one key; the digits are compared as text, so no length
+            # reaches int().
+            digits = code.lstrip("0") or "0"
+            keycode = int(digits) if len(digits) <= 3 else 256
+            if not 8 <= keycode <= 255:
                 self.warn(
                     source,
                     line,
@@ -1908,160 +2019,206 @@ class Translator:
                     f"bindcode keycode must be between 8 and 255: {code}",
                 )
                 return
-            key = "+".join([*parts, f"code:{code}"])
+            combo.keys[-1] = f"code:{keycode}"
+        try:
+            key = self.translate_key(combo_text, combo)
+        except BindError as error:
+            self.warn(source, line, rest, str(error))
+            return
+        trigger = key.rsplit("+", 1)[-1]
+        # Only the bindsym key's sway spelling makes a mouse binding
+        # (sway/commands/bind.c:177-192).
+        button = sway_mouse_button(combo.keys[0]) if kind == "bindsym" else None
+        mouse = button is not None
 
-        trailing, command = legacy_bind_trailing_options(command.strip())
-        for option in trailing:
-            if option == "--release":
-                properties.extend((("release", True), ("repeat", False)))
-            else:
-                mouse_regions.update(region_options[option])
-                exclude_titlebar |= option == "--exclude-titlebar"
+        # Sway's region flags (bind.c:359-369,384-388,459-464): a region
+        # option or --exclude-titlebar makes a mouse binding, which then
+        # covers the titlebar unless --exclude-titlebar removes it. A plain
+        # mouse binding emits no mouse-regions and --border emits border
+        # alone, without the titlebar sway adds; --exclude-titlebar emits
+        # sway's flags exactly.
+        sway_regions = set(mouse_regions)
         if exclude_titlebar:
-            mouse_regions.discard("titlebar")
-            mouse_regions.update(("border", "contents"))
+            sway_regions.discard("titlebar")
+            mouse_regions = set(sway_regions)
+            if not sway_regions:
+                # get_active_mouse_binding skips a binding that shares no
+                # region with the click (sway/input/seatop_default.c:128-139),
+                # and swayward's KDL reads no mouse-regions as every region.
+                self.warn(
+                    source,
+                    line,
+                    rest,
+                    "--exclude-titlebar without --whole-window or --border "
+                    "leaves the binding no region, so sway never runs it "
+                    "(sway/commands/bind.c:459-464, "
+                    "sway/input/seatop_default.c:128-139); swayward's KDL "
+                    "has no binding that never runs",
+                )
+                return
+        elif mouse or mouse_regions:
+            sway_regions.add("titlebar")
+        regions = ""
         if mouse_regions:
             ordered_regions = ("titlebar", "border", "contents")
             regions = "+".join(region for region in ordered_regions if region in mouse_regions)
             properties.append(("mouse-regions", regions))
-        command = self.translate_command(command)
-        if command is None:
-            self.warn(
-                source,
-                line,
-                rest,
-                "command is outside swayward's current command subset",
-            )
-            return
-        original_key = key
-        key = self.translate_key(key)
-        if key is None:
-            unsupported = next(
-                (
-                    part
-                    for part in original_key.split("+")[:-1]
-                    if not part.lower().startswith("button")
-                ),
-                original_key,
-            )
-            reason = (
-                f"unsupported mouse button {original_key}"
-                if original_key.lower().startswith("button")
-                else f"unsupported modifier {unsupported}"
-            )
-            self.warn(source, line, rest, reason)
-            return
-        # The duplicate check and its report see the key as rendered, so a
-        # numeric key and its quoted spelling collide, as they always have.
-        shown = render_name(key)
-        input_device = next(
-            (value for name, value in properties if name == "input-device"), "*"
-        )
-        binding_key = (
-            shown,
-            input_device,
-            ("release", True) in properties,
-            frozenset(mouse_regions),
-        )
+
+        # binding_key_compare's identity (sway/commands/bind.c:64-104): the
+        # device, the binding type, the conflict flags, the group, the
+        # modifier bits and the key. A keycode and a mouse button are
+        # numbers; keysyms are looked up ignoring case (bind.c:194-195).
+        if keycode is not None:
+            sway_key: tuple = ("keycode", keycode)
+        elif mouse:
+            sway_key = ("mouse", MOUSE_BUTTONS[button][0])
+        else:
+            sway_key = ("keysym", ascii_lower(trigger))
+        release = ("release", True) in properties
+        flags = (input_device, release, locked, combo.group, combo.mask)
+        sway_identity = (*flags, frozenset(sway_regions), sway_key)
+        # swayward's BindIdentity (swayward-config/src/binds/mod.rs:79-102):
+        # the KDL trigger and the emitted regions. Sway-distinct bindings
+        # can share it, and KDL rejects a duplicate identity.
+        kdl_key = trigger if mouse else sway_key
+        kdl_identity = (*flags, frozenset(mouse_regions), kdl_key)
         node = Node(
             key, props=properties, children=[Node("command", [command])], inline=True
         )
-        if not legacy_keep_first(binds, binding_key, node):
-            self.warn(source, line, rest, f"duplicate binding for {shown}; kept the first")
+        previous = binds.get(sway_identity)
+        if previous is None:
+            clash = next(
+                (entry for entry in binds.values() if entry.kdl == kdl_identity),
+                None,
+            )
+            if clash is not None:
+                self.warn(
+                    source,
+                    line,
+                    rest,
+                    f"sway keeps this apart from the binding at {clash.pos.path}:"
+                    f"{clash.pos.line} (`{clash.command}`), but both translate "
+                    f"to {key}{f' mouse-regions={regions}' if regions else ''}, "
+                    "which swayward's KDL binds only once "
+                    "(sway/commands/bind.c:64-104, "
+                    "swayward-config/src/binds/decode.rs:24-40)",
+                )
+                return
+        # binding_upsert replaces an equal binding in place, and binding_add
+        # warns through swaynag unless --no-warn (bind.c:266-302). The later
+        # binding wins here too, so the comment that carries sway's warning
+        # asks for nothing, and an overwrite that changes nothing has none.
+        binds[sway_identity] = Binding(kdl_identity, node, d.pos, command)
+        if previous is not None and previous.node != node and warn:
+            self.doc.note(
+                f"sway-to-kdl: {source}:{line}: overwriting binding "
+                f"{combo_text} for device '{input_device}' to `{command}` "
+                f"from `{previous.command}`, as sway does "
+                "(sway/commands/bind.c:280-292)"
+            )
 
     @staticmethod
-    def translate_modifier(modifier: str) -> str | None:
-        return next(
-            (
-                translated
-                for name, translated in LEGACY_MODIFIER_ALIASES.items()
-                if name.lower() == modifier.lower()
-            ),
-            None,
-        )
+    def translate_key(combo_text: str, combo: KeyCombo) -> str:
+        """The KDL key for a bind's combo, or BindError with the reason
+        swayward's KDL cannot bind it.
 
-    @staticmethod
-    def translate_key(key: str) -> str | None:
-        aliases = {
-            "button1": "MouseLeft",
-            "button2": "MouseMiddle",
-            "button3": "MouseRight",
-            "button4": "WheelScrollUp",
-            "button5": "WheelScrollDown",
-            "button6": "WheelScrollLeft",
-            "button7": "WheelScrollRight",
-            "button8": "MouseBack",
-            "button9": "MouseForward",
-            "BTN_LEFT": "MouseLeft",
-            "BTN_MIDDLE": "MouseMiddle",
-            "BTN_RIGHT": "MouseRight",
-            "BTN_SIDE": "MouseBack",
-            "BTN_BACK": "MouseBack",
-            "BTN_EXTRA": "MouseForward",
-            "BTN_FORWARD": "MouseForward",
-        }
-        parts = key.split("+")
-        non_modifiers = [
-            index
-            for index, part in enumerate(parts)
-            if Translator.translate_modifier(part) is None
-        ]
-        if len(non_modifiers) == 1:
-            trigger = parts.pop(non_modifiers[0])
-        else:
-            trigger = parts.pop()
-        translated_modifiers = [Translator.translate_modifier(part) for part in parts]
-        if any(part is None for part in translated_modifiers):
-            return None
-        parts = [part for part in translated_modifiers if part is not None] + [trigger]
-        if any(
-            (part.lower().startswith("button") or part.startswith("BTN_"))
-            and part not in aliases
-            for part in parts
-        ):
-            return None
-        return "+".join(aliases.get(part, part) for part in parts)
-
-    @staticmethod
-    def translate_command(command: str) -> str | None:
-        if match := re.fullmatch(
-            r"(exec(?:_always)?\s+(?:--no-startup-id\s+)?)(.+)", command
-        ):
-            command = match.group(1) + legacy_exec_unquote(match.group(2))
-        return legacy_command_spelling(legacy_unescape_at(command))
+        swayward binds one trigger with modifiers and at most one group
+        (swayward-config/src/binds/decode.rs:177-201,240-259). It reads every
+        Mode_switch part as Group2 and none as a key, so a sway binding that
+        holds Mode_switch has no KDL spelling.
+        """
+        if combo.mode_switch:
+            raise BindError(
+                "Mode_switch selects XKB group 2 and is also a key of the "
+                "binding in sway (sway/commands/bind.c:417-427); swayward's "
+                "KDL reads it only as Group2"
+            )
+        if not combo.keys:
+            raise BindError(
+                "binding has no key; sway binds modifiers alone, swayward "
+                "needs a trigger key"
+            )
+        if len(combo.keys) > 1:
+            extra = next(
+                (k for k in combo.keys[:-1] if not ascii_lower(k).startswith("button")),
+                None,
+            )
+            if extra is None:
+                raise BindError(f"unsupported mouse button {combo_text}")
+            raise BindError(f"unsupported modifier {extra}")
+        trigger = combo.keys[0]
+        button = sway_mouse_button(trigger)
+        if button is not None:
+            if button not in MOUSE_TRIGGERS:
+                raise BindError(f"unsupported mouse button {trigger}")
+            trigger = MOUSE_TRIGGERS[button]
+        elif ascii_lower(trigger) in KDL_POINTER_TRIGGERS:
+            raise BindError(
+                f"Unknown key or button '{trigger}': sway has no such keysym "
+                "(sway/commands/bind.c:194-199), and swayward's KDL would read "
+                "it as a pointer trigger (swayward-config/src/binds/key.rs:118-148)"
+            )
+        if combo.group is not None and button is not None:
+            raise BindError(
+                "swayward binds an XKB group only to a keyboard key "
+                "(swayward-config/src/binds/decode.rs:254-259)"
+            )
+        group = [f"Group{combo.group}"] if combo.group is not None else []
+        return "+".join([*group, *combo.modifiers, trigger])
 
     def translate_assign(
-        self, source: Path, line: int, criteria: str, target: str
+        self, source: Path, line: int, criteria: str, args: list[str]
     ) -> None:
         match = self.translate_window_criteria(source, line, "assign", criteria)
         if match is None:
             return
-        target = target.strip()
+        # cmd_assign tests whole arguments for its keywords, then joins the
+        # rest (sway/commands/assign.c:26-56). It skips one argument that
+        # starts with `→`, which needs a target after it (:26-33).
+        if args[:1] and args[0].startswith("→"):
+            if len(args) < 2:
+                self.warn(
+                    source,
+                    line,
+                    f"assign {criteria} {args[0]}",
+                    "missing workspace",
+                )
+                return
+            args = args[1:]
         property_name = "open-on-workspace"
-        if target.startswith("output "):
+        if args[:1] == ["output"]:
             property_name = "open-on-output"
-            target = target.removeprefix("output ").strip()
+            args = args[1:]
         else:
-            if target.startswith("workspace "):
-                target = target.removeprefix("workspace ").strip()
-            if target.startswith("number "):
-                property_name = "open-on-workspace-number"
-                target = target.removeprefix("number ").strip()
-                number = legacy_unquote(target, '"')
-                if not number or not number[0].isdigit():
+            if args[:1] == ["workspace"]:
+                args = args[1:]
+            if args[:1] == ["number"]:
+                args = args[1:]
+                if not args or not "0" <= args[0][:1] <= "9":
+                    number = args[0] if args else ""
                     self.warn(
                         source,
                         line,
-                        f"assign {criteria} number {target}",
+                        f"assign {criteria} number {number}",
                         f"invalid workspace number {number!r}",
                     )
                     return
+                property_name = "open-on-workspace-number"
+        if not args:
+            self.warn(
+                source,
+                line,
+                f"assign {criteria}",
+                "missing workspace or output",
+            )
+            return
+        target = join_args(args)
         self.doc.body.add(
             Node(
                 "window-rule",
                 children=[
                     self.match_node(match),
-                    Node(property_name, [legacy_unquote(target, '"')]),
+                    Node(property_name, [target]),
                 ],
             )
         )
@@ -2070,7 +2227,7 @@ class Translator:
         self, source: Path, line: int, directive: str, criteria: str
     ) -> list[tuple[str, str | bool]] | None:
         token = re.compile(
-            r'(?:(\w+)=(?:"((?:\\.|[^"])*)"|([^ "\]]+))|(tiling|floating))'
+            rf'(?<!\w)(?:(\w+)=(?:"({QUOTED_VALUE})"|([^ "\]]+))|(tiling|floating))'
         )
         criteria_body = criteria[1:-1].strip()
         matches = list(token.finditer(criteria_body))
@@ -2157,11 +2314,15 @@ class Translator:
 
     @staticmethod
     def split_amounts(words: list[str]) -> list[tuple[int, str]] | None:
-        """Parse sway size amounts such as `5 px`, `5px`, `5 ppt` or `5`."""
+        """Parse sway size amounts such as `5 px`, `5px`, `5 ppt` or `5`.
+
+        None when a word is no amount; NumberError for an amount sway's int
+        cannot hold (common/util.c:89).
+        """
         amounts: list[tuple[int, str]] = []
         index = 0
         while index < len(words):
-            found = re.fullmatch(r"(-?\d+)(px|ppt)?", words[index])
+            found = re.fullmatch(r"(-?[0-9]+)(px|ppt)?", words[index])
             if found is None:
                 return None
             unit = found.group(2)
@@ -2169,26 +2330,34 @@ class Translator:
             if unit is None and index < len(words) and words[index] in {"px", "ppt"}:
                 unit = words[index]
                 index += 1
-            amounts.append((int(found.group(1)), unit or "px"))
+            amounts.append((c_int(found.group(1)), unit or "px"))
         return amounts
 
-    def fixed_resize_set(self, words: list[str]) -> tuple[int, int] | None:
-        if words[:2] != ["resize", "set"]:
-            return None
-        amounts = self.split_amounts(words[2:])
-        if (
-            amounts is None
-            or len(amounts) != 2
-            or any(unit != "px" or value <= 0 for value, unit in amounts)
-        ):
-            return None
-        return amounts[0][0], amounts[1][0]
+    @staticmethod
+    def resize_set_amounts(words: list[str]) -> list[tuple[int, str]] | None:
+        """`resize set`'s width and height amounts, as cmd_resize_set reads
+        them (sway/commands/resize.c:421-448): `[width] <w> [px|ppt]
+        [height] <h> [px|ppt]`, each amount a strtol number with its unit
+        attached or as the next word (common/util.c:80-104).
 
-    def is_move_position_coordinates(self, words: list[str]) -> bool:
-        if words[:2] != ["move", "position"]:
-            return False
-        amounts = self.split_amounts(words[2:])
-        return amounts is not None and len(amounts) == 2
+        None when the words are not a width and a height; NumberError for an
+        amount sway's int cannot hold. An amount without a unit is px.
+        """
+        if len(words) >= 2 and words[0] == "width" and words[1] != "height":
+            words = words[1:]
+        amounts: list[tuple[int, str]] = []
+        for axis in ("width", "height"):
+            if axis == "height" and len(words) >= 2 and words[0] == "height":
+                words = words[1:]
+            found = re.fullmatch(r"([+-]?[0-9]+)(px|ppt)?", words[0]) if words else None
+            if found is None:
+                return None
+            unit, consumed = found.group(2), 1
+            if unit is None and words[1:2] in (["px"], ["ppt"]):
+                unit, consumed = words[1], 2
+            amounts.append((c_int(found.group(1)), unit or "px"))
+            words = words[consumed:]
+        return amounts if not words else None
 
     def translate_for_window(
         self, source: Path, line: int, criteria: str, command: str
@@ -2197,8 +2366,12 @@ class Translator:
         if match is None:
             return
         rule = Node("window-rule", children=[self.match_node(match)])
-        directives = legacy_command_list(command)
-        if not directives:
+        try:
+            commands = split_command_list(command)
+        except CriteriaError as error:
+            self.warn(source, line, f"for_window {criteria} {command}", str(error))
+            return
+        if not commands:
             self.warn(
                 source,
                 line,
@@ -2206,23 +2379,39 @@ class Translator:
                 "for_window needs a command",
             )
             return
-        for directive in directives:
-            words = directive.split()
+        for listed in commands:
+            directive = join_args(listed.argv)
+            words = command_words(listed)
+            if listed.criteria is not None:
+                # Criteria after a `;` select other windows (sway/commands.c:232-251).
+                words = [listed.criteria, *words]
+                directive = f"{listed.criteria} {directive}"
+            amounts = None
+            if words[:2] in (["resize", "set"], ["move", "position"]):
+                parse = (
+                    self.resize_set_amounts
+                    if words[1] == "set"
+                    else self.split_amounts
+                )
+                try:
+                    amounts = parse(words[2:])
+                except NumberError as error:
+                    self.warn(
+                        source, line, f"for_window {criteria} {directive}", str(error)
+                    )
+                    continue
             if words[:1] == ["border"]:
                 if words == ["border", "none"]:
-                    legacy_add(rule, Node("sway-border", ["none"]))
+                    rule.set(Node("sway-border", ["none"]))
                 elif words == ["border", "pixel"]:
-                    legacy_add(rule, Node("sway-border", ["pixel"]))
+                    rule.set(Node("sway-border", ["pixel"]))
                 elif (
                     len(words) == 3
                     and words[:2] == ["border", "pixel"]
-                    and words[2].isdigit()
+                    and (width := border_width(words[2])) is not None
                 ):
-                    legacy_add(
-                        rule,
-                        Node("sway-border", ["pixel"]),
-                        Node("sway-border-width", [Raw(words[2])]),
-                    )
+                    rule.set(Node("sway-border", ["pixel"]))
+                    rule.set(Node("sway-border-width", [width]))
                 else:
                     self.warn(
                         source,
@@ -2236,11 +2425,11 @@ class Translator:
             elif words == ["floating", "disable"]:
                 rule.set(Node("open-floating", [False]))
             elif words == ["layout", "tabbed"]:
-                legacy_add(rule, Node("default-column-display", ["tabbed"]))
+                rule.set(Node("default-column-display", ["tabbed"]))
             elif words == ["focus"]:
-                legacy_add(rule, Node("open-focused", [True]))
+                rule.set(Node("open-focused", [True]))
             elif words == ["nofocus"]:
-                legacy_add(rule, Node("open-focused", [False]))
+                rule.set(Node("open-focused", [False]))
             elif (
                 len(words) == 2 and words[0] in {"opacity", "opacity_set"}
             ) or (len(words) == 3 and words[:2] == ["opacity", "set"]):
@@ -2278,70 +2467,40 @@ class Translator:
                     self.warn(
                         source,
                         line,
-                        f"for_window {criteria} {command}",
+                        f"for_window {criteria} {directive}",
                         "invalid mark command",
                     )
-                    return
+                    continue
                 rule.add(Node("sway-for-window-command", [directive]))
             elif words[:2] == ["move", "workspace"] and len(words) == 3:
-                legacy_add(rule, Node("open-on-workspace", [words[2]]))
-            elif (
-                len(words) == 6
-                and words[:2] == ["resize", "set"]
-                and words[3] == "ppt"
-                and words[5] == "ppt"
-            ):
-                try:
-                    width = int(words[2])
-                    height = int(words[4])
-                except ValueError:
-                    width = height = -1
-                if width > 0 and height > 0:
-                    legacy_add(
-                        rule,
-                        preset_size(
-                            "default-column-width",
-                            "proportion",
-                            legacy_g_float(width / 100),
-                        ),
-                        preset_size(
-                            "default-window-height",
-                            "proportion",
-                            legacy_g_float(height / 100),
-                        ),
-                    )
-                else:
+                rule.set(Node("open-on-workspace", [words[2]]))
+            elif words[:2] == ["resize", "set"] and amounts is not None:
+                (width, width_unit), (height, height_unit) = amounts
+                # PresetSize holds a fixed size as an i32 and a proportion as
+                # an f64 (swayward-config/src/layout.rs:198-201); a C int
+                # (c_int) fits the first, and a C int over 100 is finite.
+                kind = {("px", "px"): "fixed", ("ppt", "ppt"): "proportion"}.get(
+                    (width_unit, height_unit)
+                )
+                if kind is None or width <= 0 or height <= 0:
                     self.warn(
                         source,
                         line,
                         f"for_window {criteria} {directive}",
                         "resize size needs manual conversion",
                     )
-            elif (
-                len(words) in {6, 7}
-                and words[:3] == ["resize", "set", "width"]
-                and words[4] == "height"
-                and words[3].isdigit()
-                and words[5].isdigit()
-                and (len(words) == 6 or words[6] == "px")
-            ):
-                legacy_add(
-                    rule,
-                    preset_size("default-column-width", "fixed", Raw(words[3])),
-                    preset_size("default-window-height", "fixed", Raw(words[5])),
-                )
-            elif (
-                resized := self.fixed_resize_set(words)
-            ) is not None:
-                width, height = resized
-                legacy_add(
-                    rule,
-                    preset_size("default-column-width", "fixed", width),
-                    preset_size("default-window-height", "fixed", height),
-                )
+                    continue
+                if kind == "proportion":
+                    width, height = width / 100, height / 100
+                rule.set(preset_size("default-column-width", kind, width))
+                rule.set(preset_size("default-window-height", kind, height))
             elif words == ["move", "position", "center"]:
                 rule.add(Node("sway-for-window-command", ["move position center"]))
-            elif self.is_move_position_coordinates(words):
+            elif (
+                words[:2] == ["move", "position"]
+                and amounts is not None
+                and len(amounts) == 2
+            ):
                 # swayward parses sway's relative `move position <x> <y>`
                 # with px or ppt units and runs it after the window maps.
                 rule.add(Node("sway-for-window-command", [directive]))
@@ -2363,17 +2522,24 @@ class Translator:
                 # command against the window after it maps.
                 rule.add(Node("sway-for-window-command", [directive]))
             elif words[:1] == ["dim_inactive"] and len(words) == 2:
-                rule.set(Node("opacity", [1.0 - float(words[1])]))
+                # As the top-level dim_inactive (translate_swayfx).
+                amount = unit_fraction(words[1])
+                if amount is None:
+                    self.warn(
+                        source,
+                        line,
+                        f"for_window {criteria} {directive}",
+                        "dim_inactive takes a number from 0 to 1",
+                    )
+                else:
+                    rule.set(Node("opacity", [1.0 - amount]))
             elif words[:1] == ["corner_radius"] and len(words) == 2:
-                legacy_add(
-                    rule,
-                    Node("geometry-corner-radius", [Raw(words[1])]),
-                    Node("clip-to-geometry", [True]),
-                )
+                rule.set(Node("geometry-corner-radius", [Raw(words[1])]))
+                rule.set(Node("clip-to-geometry", [True]))
             elif words[:1] == ["blur"] and len(words) == 2:
-                legacy_add(rule, background_effect("blur", words[1]))
+                set_background_effect(rule, "blur", words[1])
             elif words[:1] == ["shadows"] and len(words) == 2:
-                legacy_add(rule, shadow(words[1]))
+                rule.set(shadow(words[1]))
             else:
                 self.warn(
                     source,
@@ -2393,11 +2559,15 @@ class Translator:
         raw_amount: str,
         workspace: str | None = None,
     ) -> None:
-        match = re.fullmatch(r"([+-]?\d+)(?:px)?", raw_amount, re.IGNORECASE)
+        match = re.fullmatch(r"([+-]?[0-9]+)(?:px)?", raw_amount, re.IGNORECASE)
         if match is None:
             self.warn(source, line, text, "gap amount must be an integer with optional px suffix")
             return
-        amount = int(match.group(1))
+        try:
+            amount = c_int(match.group(1))
+        except NumberError as error:
+            self.warn(source, line, text, str(error))
+            return
         kind = kind.lower()
         settings = (
             self.doc.layout
@@ -2416,22 +2586,18 @@ class Translator:
             "bottom": ("bottom",),
             "left": ("left",),
         }[kind]
-        # One outer-gaps node per layout: the sides set so far keep their
-        # place, and the node moves to the end, as sway's last setting wins.
-        existing = settings.get("outer-gaps")
-        gaps = Node("outer-gaps", children=list(existing.children) if existing else [])
-        for side in sides:
-            gaps.put(Node(side, [amount]))
-        settings.set(gaps)
+        # One outer-gaps node per layout, merged as sway's last setting wins.
+        set_merged(
+            settings, Node("outer-gaps", children=[Node(side, [amount]) for side in sides])
+        )
 
     def translate_device_block(
-        self, source: Path, line: int, kind: str, selector: str, body: list[str]
+        self, d: Directive, selector: str, body: list[str]
     ) -> None:
-        selector = legacy_unquote(selector.strip(), "\"'")
-        if kind == "input":
-            self.translate_input_block(source, line, selector, body)
+        if d.name == "input":
+            self.translate_input_block(d.pos.path, d.pos.line, selector, body)
         else:
-            self.translate_output_block(source, line, selector, body)
+            self.translate_output_block(d, selector, body)
 
     def translate_input_block(
         self, source: Path, line: int, selector: str, body: list[str]
@@ -2444,9 +2610,12 @@ class Translator:
             "type:touchpad": "touchpad",
         }
         target = targets.get(selector)
+        # A setting is the item's first word by sway's whitespace
+        # (common/stringop.c:13); Python's split also breaks at Unicode
+        # spaces, so an item of only those would have no word.
         if selector == "*" and all(
-            item.split(None, 1)[0].startswith("xkb_")
-            or item.split(None, 1)[0] in {"repeat_delay", "repeat_rate"}
+            sway_split(item, 1)[0].startswith("xkb_")
+            or sway_split(item, 1)[0] in {"repeat_delay", "repeat_rate"}
             for item in body
             if item and not item.startswith("#")
         ):
@@ -2486,27 +2655,30 @@ class Translator:
             "xkb_variant": "variant",
         }
         pos = Pos(source, line)
-        translated = Node(target)  # this block's settings, merged below
+        # Later settings replace earlier ones, as sway merges input configs
+        # field by field (sway/config/input.c:52-189). The xkb settings of
+        # one block are merged at its end.
+        device = self.doc.device(target)
         xkb = Node("xkb")
         for item in body:
             if not item or item.startswith("#"):
                 continue
-            words = item.split(None, 1)
-            unhandled = legacy_unlocated_report(pos, "unhandled input directive", item)
+            words = sway_split(item, 1)
+            unhandled = Report(pos, "unhandled input directive", item)
             if words[0] == "xkb_numlock" and target == "keyboard":
                 if len(words) == 1:
-                    translated.report(unhandled, self.doc)
+                    device.report(unhandled, self.doc)
                     continue
-                value = legacy_unquote(words[1].split()[0], "\"'")
+                value = unquote_args(split_args(words[1]))[0]
                 enabled = value.lower() in {
                     "1", "yes", "on", "true", "enable", "enabled", "active", "toggle"
                 }
-                translated.add(Comment(f"sway-to-kdl: sway {item}"))
-                legacy_add(translated, Node("numlock", [] if enabled else [False]))
+                device.add(Comment(f"sway-to-kdl: sway {item}"))
+                device.set(Node("numlock", [] if enabled else [False]))
                 continue
             name = mappings.get(words[0])
             if name is None:
-                translated.report(unhandled, self.doc)
+                device.report(unhandled, self.doc)
                 continue
             value = words[1] if len(words) > 1 else "enabled"
             enum_values = {
@@ -2526,24 +2698,33 @@ class Translator:
                     "lmr": "left-middle-right",
                 },
             }
-            parent = xkb if words[0].startswith("xkb_") else translated
+            parent = xkb if words[0].startswith("xkb_") else device
             if name == "drag":
-                legacy_add(parent, Node(name, [value == "enabled"]))
+                parent.set(Node(name, [value == "enabled"]))
             elif value in {"enabled", "disabled"}:
                 # libinput booleans are bare KDL flags that take no argument:
                 # presence enables them and absence leaves them off.
                 if value == "enabled":
-                    legacy_add(parent, Node(name))
+                    parent.set(Node(name))
                 else:
+                    parent.remove(name)
                     parent.add(Comment(f"sway-to-kdl: sway {item}"))
             elif name in enum_values:
-                legacy_add(parent, Node(name, [enum_values[name].get(value, value)]))
+                parent.set(Node(name, [enum_values[name].get(value, value)]))
             elif name in {"layout", "model", "options", "rules", "variant"}:
-                legacy_add(parent, Node(name, [legacy_unquote(value, '"')]))
+                value = join_args(unquote_args(split_args(value)))
+                parent.set(Node(name, [value]))
             elif name in {"accel-speed", "scroll-factor"}:
+                # Both are FloatOrInt (swayward-config/src/input/libinput.rs:
+                # 11,46). Sway refuses NaN (sway/commands/input/pointer_accel.c:
+                # 19-22, scroll_factor.c:20-23), and KDL has no infinity.
                 try:
-                    legacy_add(parent, Node(name, [legacy_g_float(float(value))]))
+                    number = float(value)
                 except ValueError:
+                    number = math.nan
+                if math.isfinite(number):
+                    parent.set(Node(name, [number]))
+                else:
                     parent.report(unhandled, self.doc)
             elif name == "scroll-button" and not value.isdecimal():
                 button_codes = {
@@ -2558,18 +2739,54 @@ class Translator:
                 if value not in button_codes:
                     parent.report(unhandled, self.doc)
                 else:
-                    legacy_add(parent, Node(name, [button_codes[value]]))
+                    parent.set(Node(name, [button_codes[value]]))
             else:
-                legacy_add(parent, Node(name, [Raw(value)]))
+                parent.set(Node(name, [Raw(value)]))
         if xkb.children:
-            legacy_add(translated, xkb)
-        legacy_add(self.doc.device(target), *translated.children)
+            set_merged(device, xkb)
 
     def translate_output_block(
-        self, source: Path, line: int, selector: str, body: list[str]
+        self, d: Directive, selector: str, body: list[str]
     ) -> None:
-        pos = Pos(source, line)
-        translated = Node("output", [selector], block=True)
+        """One output directive or block, merged into the output's node.
+
+        Sway merges an output config into the earlier one of the same name,
+        compared exactly, field by field: a later setting wins
+        (sway/config/output.c:164-239,258-262). swayward-config keeps every
+        output node and uses the first whose name matches, ignoring ASCII
+        case (swayward-config/src/decode.rs:114-116, output.rs:150-151,
+        196-199), so each name has one node, at its first mention. Names
+        that differ only in case are one output to swayward and two to
+        sway; a later one is reported. Selectors swayward cannot combine as
+        sway does are reported by report_output_selectors.
+        """
+        pos = d.pos
+        translated = self.doc.outputs.get(selector)
+        if translated is None:
+            clash = next(
+                (
+                    name
+                    for name in self.doc.outputs
+                    if ascii_lower(name) == ascii_lower(selector)
+                ),
+                None,
+            )
+            if clash is not None:
+                text = d.text if d.block is None else f"{d.text} ... }}"
+                self.warn(
+                    pos.path,
+                    pos.line,
+                    text,
+                    f"sway keeps output {selector} apart from output {clash}, "
+                    "as it compares output names exactly "
+                    "(sway/sway/config/output.c:258), but swayward matches "
+                    "them ignoring case and uses the first "
+                    "(swayward-config/src/output.rs:150-151,196-199)",
+                )
+                return
+            translated = Node("output", [selector], block=True)
+            self.doc.outputs[selector] = translated
+            self.doc.body.add(translated)
         words = " ".join(
             item for item in body if item and not item.startswith("#")
         ).split()
@@ -2582,6 +2799,7 @@ class Translator:
             "render_bit_depth": 1,
             "subpixel": 1,
         }
+        fields: set[str] = set()  # the settings this directive translates
         index = 0
         while index < len(words):
             name = words[index]
@@ -2590,7 +2808,8 @@ class Translator:
                 # (`sway/sway/commands/output/mode.c`), swayward's parser does
                 # not. Strip it so the emitted config loads.
                 mode = re.sub(r"(@[0-9.]+)\s*Hz$", r"\1", words[index + 1], flags=re.IGNORECASE)
-                legacy_add(translated, Node("mode", [mode]))
+                translated.set(Node("mode", [mode]))
+                fields.add("mode")
                 index += 2
             elif name in {"pos", "position"} and index + 1 < len(words):
                 if "," in words[index + 1]:
@@ -2603,10 +2822,10 @@ class Translator:
                     x = y = ""
                     consumed = 0
                 if re.fullmatch(r"-?\d+", x) and re.fullmatch(r"-?\d+", y):
-                    legacy_add(
-                        translated,
-                        Node("position", props=[("x", Raw(x)), ("y", Raw(y))]),
+                    translated.set(
+                        Node("position", props=[("x", Raw(x)), ("y", Raw(y))])
                     )
+                    fields.add("position")
                     index += consumed
                 else:
                     consumed = 1
@@ -2627,7 +2846,8 @@ class Translator:
                     "flipped-270",
                 }
                 if value in valid:
-                    legacy_add(translated, Node("transform", [value]))
+                    translated.set(Node("transform", [value]))
+                    fields.add("transform")
                 else:
                     translated.report(
                         Report(pos, "unhandled output directive", f"{name} {value}"),
@@ -2635,12 +2855,18 @@ class Translator:
                     )
                 index += 2
             elif name == "scale" and index + 1 < len(words):
-                legacy_add(translated, Node("scale", [Raw(words[index + 1])]))
+                translated.set(Node("scale", [Raw(words[index + 1])]))
+                fields.add("scale")
                 index += 2
             elif name in {"enable", "on"}:
+                # The last enable or disable wins
+                # (sway/commands/output/enable.c:9, disable.c:8).
+                translated.remove("off")
+                fields.add("enabled")
                 index += 1
             elif name in {"disable", "off"}:
-                legacy_add(translated, Node("off"))
+                translated.set(Node("off"))
+                fields.add("enabled")
                 index += 1
             else:
                 argument_count = unsupported_argument_counts.get(name)
@@ -2656,7 +2882,86 @@ class Translator:
                     Report(pos, "unhandled output directive", directive), self.doc
                 )
                 index = end
-        self.doc.body.add(translated)
+        self.report_output_selectors(d, selector, translated, fields)
+        self.doc.output_fields.setdefault(selector, set()).update(fields)
+
+    def report_output_selectors(
+        self, d: Directive, selector: str, translated: Node, fields: set[str]
+    ) -> None:
+        """Report output settings whose effect in sway no KDL node can hold.
+
+        Sway builds an output's config from the `*` config, then the
+        connector's, then the "make model serial" identifier's, each merged
+        over the last (find_output_config_from_list, sway/config/output.c:
+        716-728), and an `output *` setting replaces the same setting of
+        every output stored before it (store_output_config, :264-268).
+        swayward-config has no wildcard output: Outputs::find takes the
+        first node whose name matches the connector, ignoring case, or the
+        identifier (swayward-config/src/output.rs:150-152,196-237), so an
+        `output "*"` node matches only a connector named `*`, and one output
+        never combines a connector node with an identifier node.
+
+        So each translated setting of `output *` is reported, naming the
+        outputs whose earlier setting sway replaces. A setting given through
+        both an identifier selector and a connector selector is reported on
+        the later one: the translator cannot tell whether the two name one
+        output, and if they do, sway and swayward apply different values.
+        Different settings through the two kinds are not reported: a
+        connector for one output and an identifier for another is the usual
+        multi-output config, and each node then holds its output's settings.
+        If the two do name one output, swayward reads only the first node,
+        and that case goes unreported.
+        """
+        if not fields:
+            return
+        text = d.text if d.block is None else f"{d.text} ... }}"
+        settings = ", ".join(sorted(fields))
+        if selector == "*":
+            replaced = [
+                f"{field} of output {name}"
+                for name, earlier in self.doc.output_fields.items()
+                if name != "*"
+                for field in sorted(earlier & fields)
+            ]
+            reason = (
+                f"sway applies this {settings} to every output "
+                "(sway/sway/config/output.c:716-728)"
+            )
+            if replaced:
+                reason += (
+                    f" and replaces the earlier {', '.join(replaced)} "
+                    "(sway/sway/config/output.c:264-268)"
+                )
+            reason += (
+                ", but swayward-config has no wildcard output: an output "
+                '"*" node matches only a connector named * '
+                "(swayward-config/src/output.rs:150-152,196-199); set it in "
+                "each output's node"
+            )
+            translated.report(Report(d.pos, reason, text), self.doc)
+            return
+        # An identifier is "make model serial" (output_get_identifier,
+        # sway/config/output.c:31-38); a connector name has no space.
+        identifier = " " in selector
+        shared = [
+            (name, sorted(earlier & fields))
+            for name, earlier in self.doc.output_fields.items()
+            if name not in {"*", selector}
+            and (" " in name) != identifier
+            and earlier & fields
+        ]
+        for name, both in shared:
+            connector, ident = (name, selector) if identifier else (selector, name)
+            reason = (
+                f"output {selector} and output {name} both set "
+                f"{', '.join(both)}; if {ident} is the output on {connector}, "
+                "sway applies the identifier's value over the connector's "
+                "(sway/sway/config/output.c:716-728), but swayward uses only "
+                "the first output node that matches it "
+                "(swayward-config/src/output.rs:150-152,196-237); combine "
+                "them by hand"
+            )
+            translated.report(Report(d.pos, reason, text), self.doc)
 
     def translate_swayfx(self, source: Path, line: int, text: str) -> bool:
         words = text.split()
@@ -2730,7 +3035,7 @@ class Translator:
             self.doc.layout.add(
                 Comment("SwayFX shadows; tune remaining shadow controls as needed")
             )
-            legacy_add(self.doc.layout, Node("shadow", children=[Node(state)]))
+            self.doc.layout.set(Node("shadow", children=[Node(state)]))
         elif name == "shadows_on_csd" and len(words) == 2:
             self.warn(
                 source,
@@ -2739,7 +3044,13 @@ class Translator:
                 "SwayFX shadows_on_csd has no exact swayward equivalent; tune layout shadow draw-behind-window",
             )
         elif name in {"dim_inactive", "default_dim_inactive"} and len(words) == 2:
-            opacity = 1.0 - float(words[1])
+            # The unfocused opacity, 1 - amount, is a fraction
+            # (swayward-config/src/window_rule.rs:76).
+            amount = unit_fraction(words[1])
+            if amount is None:
+                self.warn(source, line, text, f"{name} takes a number from 0 to 1")
+                return True
+            opacity = 1.0 - amount
             self.doc.note("SwayFX dim_inactive -> unfocused window opacity")
             self.doc.body.add(
                 Node(
@@ -2757,31 +3068,37 @@ class Translator:
         return True
 
     def translate_layer_effects(self, source: Path, line: int, text: str) -> None:
-        match = re.fullmatch(r'layer_effects\s+"?([^"\s]+)"?\s+(.+)', text)
-        if not match:
+        args = Directive.from_line(text, Pos(source, line)).args
+        try:
+            effects = split_command_list(join_args(args[1:])) if len(args) > 1 else []
+        except CriteriaError:
+            effects = []
+        if not effects:
             self.warn(source, line, text, "cannot parse SwayFX layer_effects")
             return
-        namespace, effects = match.groups()
+        namespace = args[0]
         rule = Node(
             "layer-rule",
             children=[
                 Node("match", props=[("namespace", "^" + re.escape(namespace) + "$")])
             ],
         )
-        for effect in legacy_layer_effects(effects):
-            words = effect.split()
+        for effect in effects:
+            words = command_words(effect)
             if words[:1] == ["blur"] and len(words) == 2:
-                legacy_add(rule, background_effect("blur", words[1]))
+                set_background_effect(rule, "blur", words[1])
             elif words[:1] == ["blur_xray"] and len(words) == 2:
-                legacy_add(rule, background_effect("xray", words[1]))
+                set_background_effect(rule, "xray", words[1])
             elif words[:1] == ["shadows"] and len(words) == 2:
-                legacy_add(rule, shadow(words[1]))
+                rule.set(shadow(words[1]))
             elif words[:1] == ["corner_radius"] and len(words) == 2:
-                legacy_add(rule, Node("geometry-corner-radius", [Raw(words[1])]))
-            elif words:
+                rule.set(Node("geometry-corner-radius", [Raw(words[1])]))
+            else:
                 rule.report(
-                    legacy_unlocated_report(
-                        Pos(source, line), "unhandled layer_effects directive", effect
+                    Report(
+                        Pos(source, line),
+                        "unhandled layer_effects directive",
+                        join_args(effect.argv),
                     ),
                     self.doc,
                 )
@@ -2797,48 +3114,19 @@ class Translator:
 # ---------------------------------------------------------------------------
 
 Handler = Callable[[Translator, Directive], bool]
-BlockHandler = Callable[[Translator, Directive, LegacyReader], bool]
-
-# The non-ASCII letters that re.IGNORECASE matches with ASCII ones, the same
-# in Python 3.9 and 3.15: `ſmart_gaps on` matched the chain's smart_gaps
-# branch.
-_LEGACY_IGNORECASE = str.maketrans({"İ": "i", "ı": "i", "ſ": "s", "K": "k"})
-
-
-def legacy_handler_key(text: str) -> str:
-    """The table key of the chain branches that could match text.
-
-    Most branches matched a name and then whitespace, `{`, `[` or the end of
-    the line, so the key is the leading run of word characters and dots,
-    folded as re.IGNORECASE folds: a key only routes, and the moved patterns
-    still decide, case included. Three branches matched a bare prefix:
-    `bindsym`/`bindcode` blocks took any options text (`bindsymx {`), and
-    `for_window` and `popup_during_fullscreen` reported any line starting
-    with the name. C3 replaces this with sway's case-insensitive lookup of
-    argv[0].
-    """
-    for prefix in ("bindsym", "bindcode", "for_window", "popup_during_fullscreen"):
-        if text.startswith(prefix):
-            return prefix
-    word = re.match(r"[\w.]*", text).group()
-    return word.translate(_LEGACY_IGNORECASE).lower()
-
+BlockHandler = Callable[[Translator, Directive], bool]  # Directive.block is set
 
 BLOCK_HANDLERS: dict[str, BlockHandler] = {
     "bar": Translator.h_bar_block,
     "mode": Translator.h_mode_block,
-    "bindsym": Translator.h_bind_block,
-    "bindcode": Translator.h_bind_block,
-    "exec": Translator.h_exec_block,
-    "exec_always": Translator.h_exec_block,
     "for_window": Translator.h_for_window_block,
     "input": Translator.h_device_block,
     "output": Translator.h_device_block,
 }
 
 HANDLERS: dict[str, Handler] = {
-    "input": Translator.h_input,
-    "output": Translator.h_output,
+    "input": Translator.h_device,
+    "output": Translator.h_device,
     "bindsym": Translator.h_bind,
     "bindcode": Translator.h_bind,
     "exec": Translator.h_exec,
@@ -2938,11 +3226,10 @@ class Comment:
 class Node:
     """A KDL node. add, set and put say how a child joins its parent.
 
-    add appends a repeatable child or a comment. set and put take a
-    singular child, last wins: set drops any child of that name and appends,
-    as `replace_layout_setting` did; put replaces the first such child in
-    place, as the old blur and titlebar-colour dicts did, and appends only
-    when there is none.
+    add appends a repeatable child or a comment, and raises on a singular
+    one (SINGULAR). set and put take a singular child, last wins: set drops
+    any child of that name and appends; put replaces the first such child in
+    place, and appends only when there is none.
     """
 
     name: str  # rendered bare, except that an all-digit name is quoted
@@ -2953,6 +3240,11 @@ class Node:
     block: bool = False  # braces even with no children: `output "x" {` `}`
 
     def add(self, child: Node | Comment) -> None:
+        if isinstance(child, Node) and child.name in SINGULAR.get(self.name, ()):
+            raise ValueError(
+                f"{child.name} is a singular child of {self.name or 'the top level'}; "
+                "use set or put"
+            )
         self.children.append(child)
 
     def set(self, child: Node) -> None:
@@ -2990,7 +3282,7 @@ class Node:
 
     def report(self, report: Report, doc: Document) -> None:
         doc.manual.append(report.item)
-        self.add(Comment(f"sway-to-kdl: {report.comment}"))
+        self.add(Comment(f"sway-to-kdl: {report.item}"))
 
 
 # Parent node name -> the names of its singular children: the
@@ -3000,7 +3292,8 @@ class Node:
 # decode.rs: every node except its multipart sections. binds, mode and
 # default-column-width decode by hand too and have no entry.
 # test-sway-to-kdl.py reads the Rust sources and fails when this drifts.
-# Nothing enforces it yet: C3 makes Node.add raise on these names.
+# Node.add raises on these names, so a singular child joins through set or
+# put and a repeated directive never emits a second one.
 SINGULAR: dict[str, frozenset[str]] = {
     "": frozenset({
         "animations", "binds", "blur", "clipboard", "config-notification",
@@ -3143,8 +3436,9 @@ class Document:
     """The translation: one field per output group, in render order."""
 
     def __init__(self) -> None:
-        # Keyed by key, device, release and mouse regions; legacy_keep_first.
-        self.binds: dict[tuple, Node] = {}
+        # Keyed by sway's binding identity; a later binding replaces an
+        # earlier one in place (Translator.translate_bind).
+        self.binds: dict[tuple, Binding] = {}
         self.modes: list[Node] = []
         # input's own settings. Sway defaults focus_follows_mouse to yes;
         # swayward defaults it off.
@@ -3157,6 +3451,12 @@ class Document:
         self.body = Node("")  # the top level, in source order
         self.urgent_timeout: Node | None = None  # rendered last in body
         self.workspaces: dict[str, Node] = {}
+        # Output nodes by name, each also in body at its first mention
+        # (Translator.translate_output_block).
+        self.outputs: dict[str, Node] = {}
+        # The settings each output selector has translated, by selector
+        # (Translator.report_output_selectors).
+        self.output_fields: dict[str, set[str]] = {}
         self.manual: list[str] = []
 
     def report(self, report: Report) -> None:
@@ -3172,47 +3472,48 @@ class Document:
         return self.devices[name]
 
     def workspace(self, name: str) -> Node:
+        """The workspace's node, created on first mention.
+
+        Workspaces render in first-mention order, the order of sway's
+        workspace_configs (sway/commands/workspace.c:13-31), which
+        workspace_next_name walks (sway/tree/workspace.c:461-480).
+        """
         if name not in self.workspaces:
             self.workspaces[name] = Node("workspace", [name], block=True)
         return self.workspaces[name]
 
-    def workspace_layout(self, name: str) -> Node:
+    def workspace_child(self, name: str, child: str) -> Node:
+        """The workspace's singular child named child, created on first use."""
         workspace = self.workspace(name)
-        layout = workspace.get("layout")
-        if layout is None:
-            layout = Node("layout")
-            workspace.add(layout)
-        return layout
+        node = workspace.get(child)
+        if node is None:
+            node = Node(child)
+            workspace.put(node)
+        return node
+
+    def workspace_layout(self, name: str) -> Node:
+        return self.workspace_child(name, "layout")
+
+    def workspace_assignment(self, name: str) -> Node:
+        return self.workspace_child(name, "sway-output-assignment")
 
 
-def legacy_add(parent: Node, *children: Node | Comment) -> None:
-    parent.children.extend(children)
+def set_merged(parent: Node, node: Node) -> None:
+    """Set node in parent, merged with parent's node of that name.
 
-
-def legacy_g_float(value: float) -> Raw:
-    return Raw(f"{value:g}")
-
-
-def legacy_workspace_assignment(doc: Document, name: str) -> Node:
-    """The workspace's sway-output-assignment node, created on first use.
-
-    Today's output listed every assigned workspace first, then the rest
-    (dict.fromkeys over two dicts), so a newly assigned workspace moves to
-    the end of the assigned ones; its assignment renders before its layout.
+    Each child of node replaces its namesake in place or is appended, and
+    the merged node moves to the end, as the later setting wins.
     """
-    workspace = doc.workspace(name)
-    assignment = workspace.get("sway-output-assignment")
-    if assignment is None:
-        assignment = Node("sway-output-assignment")
-        workspace.children.insert(0, assignment)
-        assigned = [
-            other
-            for other, node in doc.workspaces.items()
-            if other != name and node.get("sway-output-assignment") is not None
-        ]
-        rest = [other for other in doc.workspaces if other != name and other not in assigned]
-        doc.workspaces = {other: doc.workspaces[other] for other in [*assigned, name, *rest]}
-    return assignment
+    existing = parent.get(node.name)
+    if existing is not None:
+        merged = replace(node, children=list(existing.children))
+        for child in node.children:
+            if isinstance(child, Node):
+                merged.put(child)
+            else:
+                merged.add(child)
+        node = merged
+    parent.set(node)
 
 
 # ---------------------------------------------------------------------------
@@ -3272,7 +3573,7 @@ def render_head(node: Node) -> str:
 def render_item(item: Node | Comment, depth: int) -> list[str]:
     indent = INDENT * depth
     if isinstance(item, Comment):
-        return [f"{indent}// {item.text}"]
+        return [f"{indent}// {printable(item.text)}"]
     head = indent + render_head(item)
     if item.inline:
         inner = "".join(f"{render_head(child)}; " for child in item.children)
@@ -3287,10 +3588,10 @@ def render_item(item: Node | Comment, depth: int) -> list[str]:
 
 
 def render(doc: Document) -> str:
-    """The groups in today's order, each after a blank line."""
+    """The groups in a fixed order, each after a blank line."""
     groups: list[list[Node | Comment]] = []
     if doc.binds:
-        groups.append([Node("binds", children=list(doc.binds.values()))])
+        groups.append([Node("binds", children=[b.node for b in doc.binds.values()])])
     groups += [[mode] for mode in doc.modes]
     devices = list(doc.devices.values())
     groups.append(
