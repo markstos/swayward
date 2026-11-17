@@ -491,3 +491,49 @@ fn client_interactive_resize_requires_floating() {
     let (mut fullscreen, _) = set_up(WindowState::Fullscreen);
     assert!(!request_resize(&mut fullscreen));
 }
+
+fn popup_position(
+    f: &mut Fixture,
+    client: ClientId,
+    parent: &wayland_client::protocol::wl_surface::WlSurface,
+    offset: (i32, i32),
+) -> (i32, i32) {
+    let parent = f.client(client).window(parent).xdg_surface.clone();
+    let surface = f
+        .client(client)
+        .state
+        .create_popup(Some(&parent), Some(offset))
+        .surface
+        .clone();
+    surface.commit();
+    f.double_roundtrip(client);
+    let &(x, y, _, _) = f
+        .client(client)
+        .popup(&surface)
+        .configures_received
+        .last()
+        .unwrap();
+    (x, y)
+}
+
+/// Sway fits a window's popups to its output, expressed in the window's coordinates
+/// (`popup_unconstrain`, sway/desktop/xdg_shell.c:44-66). A tiled window away from the
+/// output origin keeps the popup where the client put it, and a popup may extend past the
+/// window's own edge while it stays on the output.
+#[test]
+fn tiled_popups_are_unconstrained_against_the_output() {
+    let mut f = Fixture::new();
+    f.add_output(1, (800, 600));
+    let client = f.add_client();
+    let left = windows::map_window(&mut f, client, windows::WindowSpec::titled("left"));
+    let right = windows::map_window(&mut f, client, windows::WindowSpec::titled("right"));
+
+    let on_left = popup_position(&mut f, client, &left, (100, 100));
+    assert_eq!(popup_position(&mut f, client, &right, (100, 100)), on_left);
+
+    // The 100 px popup crosses the left window's right edge at 400 px.
+    assert_eq!(
+        popup_position(&mut f, client, &left, (420, 100)),
+        (on_left.0 + 320, on_left.1)
+    );
+}

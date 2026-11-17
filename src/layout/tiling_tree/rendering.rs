@@ -10,12 +10,14 @@ impl<W: LayoutElement> TilingTree<W> {
         Rectangle::from_size(self.view_size).intersection(rect)
     }
 
+    /// The output box in the coordinates of the window's geometry, which sway unconstrains
+    /// popups against (sway/desktop/xdg_shell.c:44-66).
     pub fn popup_target_rect(&self, window: &W::Id) -> Option<Rectangle<f64, Logical>> {
         let id = self.node_for_window(window)?;
         let tile = self.tile(id)?;
-        let mut target = self.geometry(id)?;
-        target.loc += tile.window_loc();
-        target.size = tile.window_size();
+        let mut target = Rectangle::from_size(self.view_size);
+        target.loc -= self.geometry(id)?.loc;
+        target.loc -= tile.window_loc();
         Some(target)
     }
 
