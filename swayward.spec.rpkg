@@ -31,7 +31,7 @@ Version:        %{version}
 Release:        1%{?dist}
 Summary:        An i3/sway-compatible Wayland compositor
 
-SourceLicense:  GPL-3.0-or-later
+SourceLicense:  GPL-3.0-or-later AND MIT
 
 # (MIT OR Apache-2.0) AND BSD-3-Clause
 # (MIT OR Apache-2.0) AND Unicode-3.0
@@ -180,7 +180,7 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_swayward
 %endif
 
 %files
-%license LICENSE
+%license LICENSE THIRD-PARTY.md
 %doc README.md
 %doc docs/wiki
 %{_bindir}/swayward

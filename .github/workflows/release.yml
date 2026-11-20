@@ -136,6 +136,7 @@ jobs:
           install -Dm644 resources/swayward-shutdown.target "$stage/share/swayward-shutdown.target"
           install -Dm644 resources/default-config.kdl "$stage/share/default-config.kdl"
           install -Dm644 LICENSE "$stage/LICENSE"
+          install -Dm644 THIRD-PARTY.md "$stage/THIRD-PARTY.md"
 
           # Record what the binary actually needs, measured rather than
           # guessed, so an installer can check before unpacking.

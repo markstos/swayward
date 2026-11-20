@@ -17,7 +17,7 @@ pkgrel=1
 pkgdesc="An i3/sway-compatible Wayland compositor, built in Rust on Smithay"
 arch=('x86_64' 'aarch64')
 url="https://github.com/swayward-wm/swayward"
-license=('GPL-3.0-or-later')
+license=('GPL-3.0-or-later' 'MIT')
 
 # Arch enables LTO by default. libspa-sys generates a C shim for SPA's static
 # inline functions (wrap_static_fns), and LTO discards those objects before
@@ -172,4 +172,5 @@ package() {
     "$pkgdir/usr/share/swayward/default-config.kdl"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD-PARTY.md "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY.md"
 }

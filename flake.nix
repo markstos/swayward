@@ -234,7 +234,10 @@
           meta = {
             description = "i3-compatible Wayland compositor based on niri";
             homepage = "https://github.com/swayward-wm/swayward";
-            license = lib.licenses.gpl3Plus;
+            license = with lib.licenses; [
+              gpl3Plus
+              mit
+            ];
             mainProgram = "swayward";
             platforms = lib.platforms.linux;
           };
