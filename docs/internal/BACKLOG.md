@@ -18,6 +18,7 @@ reproduces.
 | Diff-family / oracle / harness engineering | [Engineering leftovers](#engineering-leftovers) below |
 | Launch / announce / templates | [Launch ops](#launch-ops) below |
 | COPR / AUR / post-beta features | [Post-beta](#post-beta) below |
+| Decided not to fix, logged so it is not re-filed | [Won't fix (recorded)](#wont-fix-recorded) below |
 
 Public docs must not link here. See [`README.md`](README.md).
 
@@ -45,6 +46,13 @@ Likely user-visible or command-gap. Confirm on current `main` + oracle/i3 harnes
 | Floating split after scratchpad show: wrong view height | [#35](https://github.com/swayward-wm/swayward/issues/35) | Was `swayward-floating-split-scratchpad-height` |
 | Focus after `[con_mark] move workspace to output` matching two containers | [#36](https://github.com/swayward-wm/swayward/issues/36) | i3 543; was `swayward-move-ws-multi-match-focus` |
 | Implement `ipc_kill_timeout` (drop IPC clients that stop reading) | [#37](https://github.com/swayward-wm/swayward/issues/37) | Was `swayward-ipc-kill-timeout` |
+| `output <name> toggle` re-enable: re-created workspace is `splitv` where sway gives `splith` (portrait output) | — | Oracle row `output_toggle_reenable` (sway-ipc-oracle `088ce65c`). Sway creates the workspace while the output's cached size is 0x0 (`sway/tree/workspace.c:219`, `sway/tree/output.c:441-450`, `sway/config/output.c:677-678,1085-1092`); swayward keeps the real size through disable (`src/backend/headless.rs:283-295`). Declared in `KNOWN_DEVIATIONS.md`. Low impact. Was `toggle-reenable-layout` |
+| Runtime-failing output subcommand plus an invalid token stops the command list; sway reports `CMD_FAILURE` and continues | — | `sway/commands.c:295-299`. Needs an oracle row. Was `pr43-cmd-failure-continue` |
+| `exec` tail not tokenized like sway (`split_args`; strip quotes only when argc==1, else `join_args`) | — | `swayward-ipc/src/command/parse/rules.rs` `parse_exec` vs sway `common/stringop.c:92-142`, `sway/commands/exec_always.c:40-44`. Differs for `exec "printf x" ""` and an embedded newline. Fix and oracle row needed. Was `rt-exec-split` |
+| `swap` of sticky or fullscreen floating containers diverges | — | i3 291-swap.t 128, 129, 134. Sway re-fullscreens con2 and focuses it (`sway/tree/container.c:1884-1889,1199-1206`); sticky floaters follow a workspace switch (`sway/input/seat.c:1209-1220`). Needs an oracle row. Was `swap-sticky-fullscreen` |
+| `workspace N gaps …` (translated) makes N eagerly created and persistent; sway does not | — | `contrib/sway-to-kdl` emits `workspace "N" { layout … }` with no assignment; `src/layout/sway_workspace.rs` treats it as declared. Sway: `sway/tree/workspace.c:314-331`. See [`specs/2026-09-16-workspace-order-model.md`](specs/2026-09-16-workspace-order-model.md). Was `ws-gaps-persistent` |
+| Rename during a pending workspace switch: stale switch index after re-sort; rename onto a stale empty name rejected during overview DnD (cosmetic) | — | `sort_sway_workspaces` updates only `active_workspace_idx` (`src/layout/monitor.rs`); `finish_workspace_switch` ignores `DndScroll`. Seen on `2aec3ab5`. Was `f34-followup` |
+| Popup and move leftovers from niri: 8 px popup padding preference; interactive move keeps the window-width restriction | — | `src/handlers/xdg_shell/configure.rs:484-526`, `src/layout/mod.rs:1833-1842`. Sway has neither. Was `popup-parity-leftovers` |
 
 ## Hygiene (small, clear)
 
@@ -61,6 +69,7 @@ Likely user-visible or command-gap. Confirm on current `main` + oracle/i3 harnes
 | Scratchpad stale-entry doc/oracle follow-ups | Was `scratchpad-stale-followups` |
 | Divergence ledger cites missing oracle row (focused-flag) | Was `low_diff_fam_parity_f2_focused_flag` |
 | Regression test doc cites missing oracle row (hinted cross-output) | Was `low_diff_fam_v3_hinted_cross_output_move` |
+| Output toggle nits: `ipc_outputs().lock().unwrap()` → snapshot; unreachable `OutputAction::Toggle` arm | `lock().unwrap()` in `toggle_disables`, `src/command/output.rs:43-50`; unreachable `Toggle` arm in `apply_transient_output_config`, `src/swayward/config_reload.rs:561`. Was `pr43-nits` |
 
 ## Engineering leftovers
 
@@ -103,6 +112,17 @@ Triage note (2026-10-28): scratch evidence under `scratch/g16` and
 | Random corpus replayable on i3 | Was `oracle-i3-random-real-replay` |
 | sway-ipc applicability gaps (hinted windows / size hints) | Was `sway-ipc-applicability-gaps` |
 | Provenance: classify deps by kind, not output path | Was `provenance-classify-by-kind` |
+| Map `src/swayward/config_reload.rs` and `src/utils/mod.rs` in `tests/oracle-targets.toml` | `contrib/targeted-oracle` exits 2 on them (unmapped). Until mapped, use a full sweep diff against the rolling baseline. Was `oracle-targets-map` |
+| Oracle `contrib/tests/pr-check` self-test fails in the pinned container | `PermissionError` case raises `KeyError: 'resolved'` (likely running as root); passes in distrobox. Was `oracle-prcheck-root` |
+
+### sway-to-kdl translator
+
+| Item | Hint |
+| --- | --- |
+| `output` scale / position arguments not checked against swayward types or KDL syntax | `scale 11` (max 10), `position 2147483648 0` (i32), `scale "2` (unterminated string), Unicode digits emitted unquoted; no manual-attention report. Was `kdl-output-arg-check` |
+| Accepts KDL-only `output X off` / `on`; sway accepts only `disable` / `enable` | `sway/commands/output.c`. Was `kdl-output-off-on` |
+| Deep symlink include chains raise `RecursionError` (Python 3.9) | ~1,100 symlinks; path resolution sits outside the per-file `OSError` handler and aborts the remaining glob matches. Was `kdl-symlink-recursion` |
+| `c_int` uses a backtracking-prone regex | Replace with the linear scan used by `strtol_text`. Low: inputs are pre-cleaned, no known slow input. Was `kdl-c-int-regex` |
 
 ## Post-beta
 
@@ -112,6 +132,7 @@ declared in `KNOWN_DEVIATIONS.md` (e.g. global fullscreen spans one output).
 | Item | Hint |
 | --- | --- |
 | Post-beta1 umbrella (refused until after beta) | Was `post-beta1-list` |
+| Output selector redesign: sway's stored `output` entries layered over KDL sections | Parked (large, risky). Design: [`specs/2026-11-20-output-selectors.md`](specs/2026-11-20-output-selectors.md). Oracle row `output_identifier_unknown` (sway-ipc-oracle `db931de8`) mismatches on `main`; declared in `KNOWN_DEVIATIONS.md`. `9d6ea061` is not landable |
 | Global fullscreen spans every output | Declared deviation; was `feature-global-fullscreen-span-outputs` |
 | Floating-group residual random seeds | Was `fcg-random-residual-group-seeds` |
 | Parity S2 output layout geometry | Was `parity-s2-output-layout-geometry` |
@@ -121,6 +142,16 @@ declared in `KNOWN_DEVIATIONS.md` (e.g. global fullscreen spans one output).
 | Touchpad GET_INPUTS oracle row on real hardware | Was `touchpad-libinput-hardware-oracle-row` |
 | Fedora COPR | Not a beta gate; GitHub RPMs ship. Was `deploy-copr-fedora` |
 | AUR | Not a beta gate; Arch pkg on GitHub release. Was `deploy-aur` |
+
+## Won't fix (recorded)
+
+Decided; logged so the numbers and refusals are not a surprise.
+
+| Item | Hint |
+| --- | --- |
+| i3 291-swap.t: 35 intentional skips (X11 absolute rectangles, i3 floating wrapper) | 28 `x11_absolute_geometry` rect skips (97-108, 115-118, 121-124, 130-133, 135-138) that native `xdg_toplevel` cannot place; 7 `i3_floating_wrapper` skips (109-113, 120, 125), sway has no wrapper. Documented skips in `tests/i3/coverage.toml` (`291-swap.t`: 96 pass, 39 skip, 3 open fails tracked as `swap-sticky-fullscreen`). Was `i3-291-known-fails` |
+| sway-to-kdl lexer edge cases: NUL in args, exotic delimiters, ~40k commands on one line | NUL unreachable (`split_args` truncates); only `;,` and `,` delimiters reach it; quadratic only at ~40k commands per line. Quotes kept in argv by design (`sway/commands.c:264-272`). Was `kdl-lexer-wontfix` |
+| sway-to-kdl: keyword and one-dimension `resize set` forms (#41) | Reported, not translated: floating state cannot be inferred from config. `floating enable, resize set 800 600` translates. Revisit only if a sound rule appears. Was `kdl-resize-set-forms` |
 
 ## mu archive
 
