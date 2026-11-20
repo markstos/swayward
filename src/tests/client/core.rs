@@ -120,6 +120,8 @@ pub struct State {
     pub seat: Option<WlSeat>,
     pub keyboard: Option<WlKeyboard>,
     pub keyboard_enter_serial: Option<u32>,
+    /// Depressed modifier mask from the last `wl_keyboard.modifiers`.
+    pub keyboard_mods_depressed: Option<u32>,
     pub shm: Option<WlShm>,
 
     // xdg-shell and related protocols.
@@ -355,6 +357,7 @@ impl Client {
             seat: None,
             keyboard: None,
             keyboard_enter_serial: None,
+            keyboard_mods_depressed: None,
             xdg_wm_base: None,
             xdg_wm_base_version: None,
             xdg_activation: None,

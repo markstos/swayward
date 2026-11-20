@@ -737,3 +737,69 @@ workspace "2" {}"#,
         "an overview arrow was rejected while Num Lock was on"
     );
 }
+
+/// Hold Super, launch an exclusive layer surface with a chord, release Super,
+/// and return the depressed modifier mask the layer client ends up with.
+fn depressed_mods_after_chord_launch(binds: &str) -> Option<u32> {
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_shell_v1::Layer;
+    use smithay::reexports::wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1::KeyboardInteractivity;
+
+    let config = swayward_config::Config::parse_mem(binds).unwrap();
+    let mut fixture = Fixture::with_config(config);
+    fixture.add_output(1, (1280, 720));
+    let client = fixture.add_client();
+    fixture.double_roundtrip(client);
+
+    // Super down, then `d` down and up: the chord that starts the launcher.
+    key_event(&mut fixture, 133, true);
+    key_event(&mut fixture, 40, true);
+    key_event(&mut fixture, 40, false);
+
+    // The launcher maps while Super is still held.
+    let layer = fixture
+        .client(client)
+        .create_layer(None, Layer::Overlay, "launcher");
+    let surface = layer.surface.clone();
+    layer.set_configure_props(crate::tests::client::LayerConfigureProps {
+        size: Some((100, 50)),
+        kb_interactivity: Some(KeyboardInteractivity::Exclusive),
+        ..Default::default()
+    });
+    layer.commit();
+    fixture.double_roundtrip(client);
+    let layer = fixture.client(client).layer(&surface);
+    layer.attach_new_buffer();
+    layer.set_size(100, 50);
+    layer.ack_last_and_commit();
+    fixture.double_roundtrip(client);
+    assert_eq!(
+        fixture
+            .swayward()
+            .keyboard_focus
+            .surface()
+            .map(|s| s.id().protocol_id()),
+        Some(surface.id().protocol_id())
+    );
+    let held = fixture.client(client).state.keyboard_mods_depressed;
+    assert_ne!(held.unwrap_or(0), 0, "the launcher entered with Super held");
+
+    key_event(&mut fixture, 133, false);
+    fixture.double_roundtrip(client);
+    fixture.client(client).state.keyboard_mods_depressed
+}
+
+/// A focused client must learn that a modifier was released even when the
+/// release itself is consumed by a bind on the bare modifier key. Otherwise a
+/// launcher opened by `Super+d` believes Super is held and drops typed text.
+#[test]
+fn bare_modifier_bind_still_tells_the_focused_client_the_modifier_was_released() {
+    let chord_only = r#"binds { Super+d { command "nop launch"; }; }"#;
+    assert_eq!(depressed_mods_after_chord_launch(chord_only), Some(0));
+
+    let with_bare_super = r#"binds {
+        Super+d { command "nop launch"; }
+        Super_L repeat=false { command "nop show"; }
+        Super_L release=true { command "nop hide"; }
+    }"#;
+    assert_eq!(depressed_mods_after_chord_launch(with_bare_super), Some(0));
+}
