@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import difflib
 import functools
 import importlib.machinery
@@ -6,6 +7,7 @@ import importlib.util
 import json
 import os
 import pickle
+import random
 import re
 import subprocess
 import sys
@@ -3942,6 +3944,392 @@ class SingularTests(unittest.TestCase):
         arms = set(re.findall(r'^\s*"([a-z-]+)" =>', text[start:end], re.M))
         self.assertTrue({"output", "window-rule", "include"} <= multipart <= arms)
         self.assertEqual(self.s2k.SINGULAR[""], frozenset(arms - multipart))
+
+
+# ---------------------------------------------------------------------------
+# Fuzz smoke test
+#
+# A small seeded generator of edge-case inputs: continuations, unbalanced and
+# deep blocks, bytes that are not UTF-8, NUL, Unicode digits and spaces, long
+# numbers, odd bindings, `resize set`, dim_inactive and border values, input
+# and output settings, criteria quoting, and includes that are missing or
+# loop. Each seed builds one config through random.Random(seed), so
+# fuzz_case(seed) returns the same config, files and symlinks on every run and
+# Python version. Large runs are done by hand with a bigger seed range.
+# ---------------------------------------------------------------------------
+
+FUZZ_SEEDS = range(300)
+
+# Configs the checks run on every time: criteria holding an unclosed quoted
+# run of 40 or 2,000 backslashes, on which a pattern with two ways to match a
+# backslash takes exponential time, and one of each `resize set` form
+# cmd_resize_set reads (sway/commands/resize.c:421-448).
+FUZZ_FIXED_CONFIGS = [
+    *(
+        f'{rule} [app_id="' + "\\" * count + f']{rest}\n'
+        for rule, rest in [
+            ("for_window", " floating enable"), ("assign", " workspace 2"),
+            ("no_focus", ""),
+        ]
+        for count in (40, 2000)
+    ),
+    "for_window [app_id=x] resize set 10 20\n",
+    "for_window [app_id=x] resize set width 10px 20 px\n",
+    "for_window [app_id=x] resize set 10 ppt height 20ppt\n",
+    "for_window [app_id=x] resize set width 10 px height 20\n",
+]
+
+# "\udcXX" is a lone byte 0xXX once the case is encoded with surrogateescape:
+# none of these is valid UTF-8.
+FUZZ_BAD_BYTES = ["\udcff", "\udc80", "\udcc3", "\udcfe\udcff"]
+FUZZ_SPACES = [
+    " ", "\t", "\x0b", "\x0c", "\r", "\x1c", "\x1f", "\x85", "\u00a0", "\u2003",
+    "\u2028", "\u3000",
+]
+# U+0663 and U+FF11 are Unicode digits, U+00B2 is a superscript two.
+FUZZ_DIGITS = ["\u0663", "\u0663\u0664", "\uff11", "\u00b2"]
+FUZZ_WORDS = [
+    "", "x", "-", "--", "on", "off", "yes", "no", "enable", "disable", "toggle",
+    "none", "smart", "normal", "pixel", "px", "ppt", "ms", "$x", "$", "$$", "\\$x",
+    '"', "'", '"a b"', "'a b'", '""', "\\", "[", "]", "{", "}", ";", ",", "→",
+    "->", "é", "😀", "\u200b", "\x00", "a\x00b",
+]
+FUZZ_MODIFIERS = [
+    "Mod1", "Mod2", "Mod3", "Mod4", "Mod5", "mod4", "MOD4", "Shift", "Lock",
+    "Control", "Ctrl", "Alt", "Super", "Mode_switch", "Group1", "Group2", "Group3",
+    "Group4", "Group5", "Group0", "Group", "$mod", "", "Mod6",
+]
+FUZZ_KEYS = [
+    "a", "Return", "XF86AudioMute", "button1", "button3", "button9", "BTN_LEFT",
+    "BTN_BOGUS", "36", "0", "-1", "", "+", "Mod4",
+]
+FUZZ_BIND_OPTIONS = [
+    "--locked", "--release", "--no-repeat", "--to-code", "--whole-window",
+    "--border", "--exclude-titlebar", "--no-warn", "--inhibited", "--input-device=",
+    '--input-device="a b"', "--input-device=1:2:x", "--bogus", "--", "-",
+]
+FUZZ_CRITERIA = [
+    "[app_id=foot]", '[title="a ] b"]', '[class="a\\"b"]', "[title='x y']",
+    '[app_id="]', "[app_id=]", "[=x]", "[a", "[app_id=x", "[]", "[floating]",
+    "[urgent=latest]", "[con_id=1]", "[app_id=x;y]", "[app_id=x] [title=y]",
+    '[con_mark="\\\\"]', '[title="\\', "[app_id=\udcff]",
+]
+FUZZ_COMMANDS = [
+    "kill", "exec foot", 'exec "echo \\"x\\""', "floating enable", "nop",
+    "mode default", "border pixel 3", "move position center", "opacity 0.5",
+    "mark --add x", "sticky enable", "title_format %title", "move workspace 3",
+    "layout tabbed", "", "floating enable; kill", "kill,", ";;",
+]
+FUZZ_INPUT_SETTINGS = [
+    "xkb_layout", "xkb_variant", "xkb_options", "xkb_numlock", "xkb_capslock",
+    "repeat_delay", "repeat_rate", "tap", "dwt", "natural_scroll", "accel_profile",
+    "pointer_accel", "scroll_factor", "scroll_button", "scroll_method",
+    "click_method", "tap_button_map", "events", "left_handed", "bogus",
+]
+FUZZ_INPUT_SELECTORS = [
+    "*", "type:keyboard", "type:touchpad", "type:pointer", '"type:touchpad"',
+    "1:2:x", '"Some Name"', "", "\udcff",
+]
+FUZZ_OUTPUT_NAMES = [
+    "*", "DP-1", '"DP-1"', "dp-1", "HDMI-A-1", '"Some Name"', "--", "", "\udcff",
+    "$out",
+]
+FUZZ_OUTPUT_SETTINGS = [
+    "mode", "res", "resolution", "mode --custom", "pos", "position", "scale",
+    "scale_filter", "transform", "enable", "disable", "on", "off", "toggle", "bg",
+    "background", "adaptive_sync", "dpms", "power", "subpixel", "max_render_time",
+    "render_bit_depth", "allow_tearing", "bogus",
+]
+FUZZ_OUTPUT_VALUES = [
+    "1920x1080", "1920x1080@60Hz", "1920x1080@59.951Hz", "0x0", "x", "1x",
+    "1920x1080@", "@60Hz", "0 0", "1920,0", "-10 20", "10 x", "90", "flipped-270",
+    "~/w.png fill", "rgb", "#000000 solid_color",
+]
+
+
+def fuzz_number(rng):
+    """A number argument, often one a naive int() or float() mishandles."""
+    choice = rng.random()
+    if choice < 0.3:
+        return str(rng.choice([0, 1, 2, 3, 10, 50, 100, 800, 1920, -1, -5]))
+    if choice < 0.45:
+        # A long run of zeroes before a digit or a non-digit, on which a
+        # backtracking number regex takes quadratic time.
+        return "0" * rng.randint(60, 6000) + rng.choice(["1", "x", "", ".5"])
+    if choice < 0.55:
+        # Past 4300 digits int() raises on Python 3.11 and later.
+        return "9" * rng.choice([rng.randint(20, 4300), rng.randint(4301, 6000)])
+    if choice < 0.7:
+        return rng.choice(FUZZ_DIGITS)
+    return rng.choice([
+        "-0", "+7", "007", "0.5", "1.5", "-0.5", ".5", "1e400", "-1e400", "1e-400",
+        "nan", "NaN", "inf", "-inf", "0x10", "1_000", "99999999999", "",
+        "1" + rng.choice(FUZZ_SPACES) + "2", "x",
+    ])
+
+
+def fuzz_word(rng):
+    choice = rng.random()
+    if choice < 0.5:
+        return rng.choice(FUZZ_WORDS)
+    if choice < 0.7:
+        return fuzz_number(rng)
+    if choice < 0.85:
+        return rng.choice(FUZZ_BAD_BYTES)
+    return rng.choice(FUZZ_SPACES)
+
+
+def fuzz_bind(rng):
+    name = rng.choice(["bindsym", "bindcode", "BindSym", "BINDCODE"])
+    options = [rng.choice(FUZZ_BIND_OPTIONS) for _ in range(rng.choice([0, 0, 1, 2, 3]))]
+    modifiers = [rng.choice(FUZZ_MODIFIERS) for _ in range(rng.choice([0, 1, 1, 2, 3]))]
+    key = "+".join(modifiers + [rng.choice(FUZZ_KEYS + [fuzz_word(rng)])])
+    command = rng.choice(FUZZ_COMMANDS + [fuzz_resize(rng), "--release exec x"])
+    return " ".join([name, *options, key, command])
+
+
+def fuzz_resize(rng):
+    def size():
+        return fuzz_number(rng) + rng.choice(["", " px", " ppt", "px", "ppt", " x"])
+
+    form = rng.choice([
+        "{} {}", "width {} {}", "{} height {}", "width {} height {}", "width {}",
+        "height {}", "height {} width {}", "{}", "", "{} {} {}", "width",
+        "width {} height",
+    ])
+    return ("resize set " + form.format(size(), size(), size())).rstrip()
+
+
+def fuzz_criteria_rule(rng):
+    name = rng.choice(["for_window", "assign", "no_focus", "For_Window"])
+    rest = rng.choice(FUZZ_COMMANDS + [
+        fuzz_resize(rng), "output DP-1", "number 3", "workspace number x", "→", "-> 2",
+        "→ 2", "dim_inactive " + fuzz_number(rng),
+    ])
+    return f"{name}{rng.choice([' ', '', '  '])}{rng.choice(FUZZ_CRITERIA)} {rest}"
+
+
+def fuzz_dim_inactive(rng):
+    value = rng.choice([fuzz_number(rng), fuzz_word(rng), "0.5 0.5", "0.2", "1", "2"])
+    return f"{rng.choice(['dim_inactive', 'default_dim_inactive'])} {value}"
+
+
+def fuzz_border(rng):
+    width = fuzz_number(rng)
+    return rng.choice([
+        f"default_border pixel {width}", f"default_border normal {width}",
+        f"default_border {width}pixel", f"default_floating_border pixel {width}",
+        f"new_window pixel {width}", f"new_float normal {width}",
+        f"for_window [app_id=x] border pixel {width}", f"titlebar_padding {width}",
+        f"titlebar_border_thickness {width}", f"gaps inner {width}",
+        f"workspace 1 gaps outer {width}", f"floating_minimum_size {width} x {width}",
+        f"force_display_urgency_hint {width} ms", f"seat * hide_cursor {width}",
+    ])
+
+
+def fuzz_input(rng):
+    selector = rng.choice(FUZZ_INPUT_SELECTORS)
+    setting = rng.choice(FUZZ_INPUT_SETTINGS)
+    gap = rng.choice(FUZZ_SPACES)
+    value = rng.choice([fuzz_word(rng), "us,de", "enabled", "flat", "lrm", "BTN_LEFT"])
+    choice = rng.random()
+    if choice < 0.2:
+        return f"input {selector}{rng.choice(['', ' '])}{gap}"
+    if choice < 0.6:
+        return f"input {selector} {setting}{gap}{value}"
+    return f"input {selector} {{\n{gap}{setting}{gap}{value}{gap}\n}}"
+
+
+def fuzz_output(rng):
+    name = rng.choice(FUZZ_OUTPUT_NAMES)
+    settings = [
+        f"{rng.choice(FUZZ_OUTPUT_SETTINGS)} "
+        f"{rng.choice(FUZZ_OUTPUT_VALUES + [fuzz_word(rng), fuzz_number(rng)])}".rstrip()
+        for _ in range(rng.randint(0, 3))
+    ]
+    if rng.random() < 0.5:
+        return f"output {name} " + " ".join(settings)
+    return "\n".join([f"output {name} {{", *settings, "}"])
+
+
+def fuzz_include(rng, files, links):
+    """An include of something missing or looping; the files and symlinks it
+    names go into files and links, each a dict from name to content or target."""
+    choice = rng.choice(["missing", "glob", "self", "cycle", "symlink", "dir", "subst"])
+    if choice == "missing":
+        return "include " + rng.choice(["missing", "missing/x.conf", '"no such"', "''"])
+    if choice == "glob":
+        return "include " + rng.choice(["nomatch*", "*", "inc*", "[", "**", "sub/*"])
+    if choice == "self":
+        return "include " + rng.choice(["config", "./config", "*"])
+    if choice == "cycle":
+        files["a.conf"] = "include b.conf\nexec a\n"
+        files["b.conf"] = "include a.conf\nexec b\n" + fuzz_line(rng, files, links, 1)
+        return "include a.conf"
+    if choice == "symlink":
+        links.update(loop="loop", ping="pong", pong="ping")
+        return "include " + rng.choice(["loop", "ping", "*"])
+    if choice == "dir":
+        files["sub/x.conf"] = fuzz_line(rng, files, links, 1)
+        return "include " + rng.choice(["sub", "sub/", "sub/*", "."])
+    return "include " + rng.choice(["$(x)", "`x`", "$undefined"])
+
+
+def fuzz_continuation(rng, files, links, depth):
+    text = fuzz_line(rng, files, links, depth + 1)
+    split = rng.randint(0, len(text))
+    joint = "\\\n" + rng.choice(["", " ", "\t", "    ", "\\\n"])
+    return text[:split] + joint + text[split:]
+
+
+def fuzz_block(rng, files, links, depth):
+    head = rng.choice([
+        "mode x", 'mode --pango_markup "a b"', "bar", "input *", "output DP-1",
+        "for_window [app_id=x]", "bindsym", "bindsym --locked", "seat *", "unknown",
+        "<commands>", "",
+    ])
+    opener = rng.choice([" {", "{", "\n{", " { }", " {  # c", " { kill }"])
+    body = [fuzz_line(rng, files, links, depth + 1) for _ in range(rng.randint(0, 3))]
+    closer = rng.choice(["}", "}", "} # x", "  }", "", "}\n}", "} x"])
+    return "\n".join([head + opener, *body, closer])
+
+
+def fuzz_deep(rng):
+    # Up to 1,200 levels, past both MAX_BLOCK_DEPTH and Python's recursion limit.
+    depth = rng.choice([rng.randint(60, 70), rng.randint(65, 1200)])
+    closed = rng.choice([depth, depth, rng.randint(0, depth), depth + 3])
+    return rng.choice(["a {\n", "mode m {\n", "{\n"]) * depth + "}\n" * closed
+
+
+def fuzz_line(rng, files, links, depth=0):
+    if depth > 3:
+        return rng.choice(["exec x", "kill", "", "}"])
+    choice = rng.randrange(14)
+    if choice == 0:
+        return fuzz_continuation(rng, files, links, depth)
+    if choice == 1:
+        return fuzz_block(rng, files, links, depth)
+    if choice == 2:
+        return fuzz_deep(rng)
+    if choice == 3:
+        return fuzz_bind(rng)
+    if choice == 4:
+        return rng.choice(["for_window [app_id=x] ", "bindsym Mod4+r "]) + fuzz_resize(rng)
+    if choice == 5:
+        return fuzz_dim_inactive(rng)
+    if choice == 6:
+        return fuzz_border(rng)
+    if choice == 7:
+        return fuzz_input(rng)
+    if choice == 8:
+        return fuzz_criteria_rule(rng)
+    if choice == 9:
+        return fuzz_include(rng, files, links)
+    if choice == 10:
+        return fuzz_output(rng)
+    if choice == 11:
+        return rng.choice(["set $x ", "set $mod ", "exec ", "nop ", "font "]) + fuzz_word(rng)
+    if choice == 12:
+        # A known word with a stray byte, NUL or odd space spliced in.
+        text = rng.choice(["bindsym Mod4+a exec x", "output DP-1 scale 2", "exec a b"])
+        split = rng.randint(0, len(text))
+        return text[:split] + rng.choice(FUZZ_BAD_BYTES + FUZZ_SPACES + ["\x00"]) + text[split:]
+    return " ".join(fuzz_word(rng) for _ in range(rng.randint(1, 4)))
+
+
+def fuzz_case(seed):
+    """The config for seed as bytes, with the extra files and symlinks it needs."""
+    rng = random.Random(seed)
+    files, links = {}, {}
+    lines = [fuzz_line(rng, files, links) for _ in range(rng.randint(1, 8))]
+    text = rng.choice(["\n", "\r\n"]).join(lines) + rng.choice(["\n", "", "\\", "\n\\\n"])
+    encode = functools.partial(str.encode, encoding="utf-8", errors="surrogateescape")
+    return encode(text), {name: encode(body) for name, body in files.items()}, links
+
+
+class FuzzSmokeTests(unittest.TestCase):
+    """Seeded generated configs through the CLI; no goldens."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.s2k = load_script()
+
+    def run_case(self, seed):
+        """None when the translator handles seed's config, else what went wrong."""
+        return self.run_config(*fuzz_case(seed))
+
+    def run_config(self, config, files=None, links=None):
+        """None when the translator handles config, given as bytes, with its
+        extra files and symlinks, else what went wrong."""
+        files, links = files or {}, links or {}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "config").write_bytes(config)
+            for name, body in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_bytes(body)
+            for name, target in links.items():
+                (root / name).symlink_to(target)
+            # sys.executable, so the suite's Python also runs the translator.
+            try:
+                result = subprocess.run(
+                    [sys.executable, SCRIPT, root / "config"], capture_output=True,
+                    timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                return "timed out after 30 s"
+        try:
+            result.stdout.decode("utf-8")
+            stderr = result.stderr.decode("utf-8")
+        except UnicodeDecodeError as error:
+            return f"output is not UTF-8: {error}"
+        problems = []
+        # main returns 0 whether or not directives need manual attention.
+        if result.returncode != 0:
+            problems.append(f"exit status {result.returncode}")
+        if "Traceback (most recent call last)" in stderr:
+            problems.append("traceback")
+        if self.s2k.TRANSLATOR_FAILED in stderr or self.s2k.READER_FAILED in stderr:
+            problems.append("safety-net report")
+        if "manual attention: " not in stderr:
+            problems.append("no manual-attention summary")
+        if not problems:
+            return None
+        return f"{', '.join(problems)}\nstderr tail:\n{stderr[-2000:]}"
+
+    def test_generated_configs_translate_without_crashing(self):
+        workers = min(8, os.cpu_count() or 1)
+        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+            outcomes = list(pool.map(self.run_case, FUZZ_SEEDS))
+        failures = [(s, o) for s, o in zip(FUZZ_SEEDS, outcomes) if o is not None]
+        report = []
+        for seed, outcome in failures[:3]:
+            config, files, links = fuzz_case(seed)
+            report.append(
+                f"seed {seed}: {outcome}\nconfig: {config!r}\n"
+                f"files: {files!r}\nsymlinks: {links!r}"
+            )
+        self.assertEqual(
+            [seed for seed, _ in failures], [],
+            f"{len(failures)} of {len(FUZZ_SEEDS)} generated configs failed\n\n"
+            + "\n\n".join(report),
+        )
+
+    def test_fixed_configs_translate_without_crashing(self):
+        configs = [config.encode() for config in FUZZ_FIXED_CONFIGS]
+        workers = min(8, os.cpu_count() or 1)
+        with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+            outcomes = list(pool.map(self.run_config, configs))
+        failures = [
+            f"config: {config[:120]!r}\n{outcome}"
+            for config, outcome in zip(configs, outcomes)
+            if outcome is not None
+        ]
+        self.assertEqual(
+            failures, [],
+            f"{len(failures)} of {len(configs)} fixed configs failed\n\n"
+            + "\n\n".join(failures[:3]),
+        )
 
 
 if __name__ == "__main__":
